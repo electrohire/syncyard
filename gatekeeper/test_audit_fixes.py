@@ -645,6 +645,77 @@ check("E1 sweep: summary counts come from the threaded list",
       "active=0 waiting=1" in out, out)
 
 
+# ---------------------------------------------------------------------------
+# Submit/adopt save-failure visibility: a record write that cannot
+# verify (the write-denial wave shape) is ledgered as submit_failed,
+# logged loudly, and exits 6 instead of raising out of the caller
+# with no trace in the record (the 2026-11-15/16 cadence-read
+# submission failures).
+# ---------------------------------------------------------------------------
+
+sf_dir = os.path.join(ROOT, "submit-fail")
+os.makedirs(os.path.join(sf_dir, "queue"))
+gk.QUEUE_DIR = os.path.join(sf_dir, "queue")
+gk.LEDGER = os.path.join(sf_dir, "ledger.jsonl")
+gk.load_jobs = ORIG["load_jobs"]
+sf_events = []
+gk.ledger_soft = ledger_capture_factory(sf_events)
+sf_hlog = []
+gk.hlog = lambda msg: sf_hlog.append(msg)
+
+
+def sf_raising_save(job):
+    raise IOError("save_job could not verify a write for job %s"
+                  % job["id"])
+
+
+gk.save_job = sf_raising_save
+sf_script = os.path.join(sf_dir, "small.ps1")
+with open(sf_script, "wb") as f:
+    f.write(b"# small\n")
+sf_lane = None
+for lane in gk.LANES:
+    if gk.route_refusal(lane, "run.yml") is None:
+        sf_lane = lane
+        break
+sf_args = SimpleNamespace(
+    program="audit", workflow="run.yml", lane=sf_lane,
+    script=sf_script, grab_path=None, cwd=".", image=None,
+    mounts=None, needs_cpu=None, needs_ram_mb=None,
+    needs_storage_mb=None, needs_gpu=None, venue="auto",
+    expected_min=1, key="savefail-audit", maintenance=False,
+    notify_chat=None, priority=None)
+exc, rc, out, err = capture(gk.cmd_submit, sf_args)
+check("submit save-failure: exits 6 without raising, ledgers "
+      "submit_failed, and records nothing in the queue",
+      exc is None and rc == 6
+      and any(e["event"] == "submit_failed"
+              and e.get("context") == "submit"
+              and e.get("key") == "savefail-audit" for e in sf_events)
+      and any("SUBMIT_FAILED" in m for m in sf_hlog)
+      and "NOT queued" in (out + err)
+      and not os.listdir(gk.QUEUE_DIR),
+      (exc, rc, out, err, sf_events))
+
+sf_events.clear()
+sf_hlog.clear()
+adopt_args = SimpleNamespace(
+    program="audit", workflow="run.yml", lane=sf_lane,
+    run_id=424242, expected_min=1, key="savefail-adopt",
+    notify_chat=None)
+exc, rc, out, err = capture(gk.cmd_adopt, adopt_args)
+check("adopt save-failure: exits 6 without raising and ledgers "
+      "submit_failed with context=adopt",
+      exc is None and rc == 6
+      and any(e["event"] == "submit_failed"
+              and e.get("context") == "adopt"
+              and e.get("key") == "savefail-adopt" for e in sf_events)
+      and any("SUBMIT_FAILED" in m for m in sf_hlog)
+      and not os.listdir(gk.QUEUE_DIR),
+      (exc, rc, out, err, sf_events))
+gk.save_job = ORIG["save_job"]
+
+
 print()
 if failures:
     print("TEST_AUDIT_FIXES: FAIL (%d failing)" % len(failures))
