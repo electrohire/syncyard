@@ -1838,7 +1838,27 @@ def cmd_submit(args):
             job["image"] = image
         if getattr(args, "mounts", None):
             job["mounts"] = args.mounts
-    save_job(job)
+    try:
+        save_job(job)
+    except (IOError, OSError) as exc:
+        # A submission whose record cannot be written (the VM
+        # write-denial wave shape) must not vanish without a
+        # trace: ledger the failure softly (the ledger append
+        # itself may be denied mid-wave, and that must never mask
+        # the original error), log it loudly either way, and exit
+        # 6 so callers can tell a write-denial (retry next cycle)
+        # from a genuine submission error.
+        ledger_soft("submit_failed", job_id=job["id"], key=job["key"],
+                    program=job["program"], workflow=job["workflow"],
+                    context="submit", error=str(exc)[:200])
+        hlog("SUBMIT_FAILED job=%s key=%s context=submit error=%s"
+             % (job["id"], job["key"], exc))
+        print("ERROR: submission %s could not be recorded: the queue "
+              "write did not verify (%s). The job is NOT queued. "
+              "This is the write-denial failure shape (exit 6): "
+              "retry the submission on the next cycle."
+              % (job["id"], exc))
+        return 6
     ledger("submitted", job_id=job["id"], key=job["key"],
            program=job["program"], workflow=job["workflow"],
            lane=job["lane"], script_sha256=job["script_sha256"])
@@ -1895,7 +1915,24 @@ def cmd_adopt(args):
         "priority": 0,
         "priority_source": "auto",
     }
-    save_job(job)
+    try:
+        save_job(job)
+    except (IOError, OSError) as exc:
+        # Same visibility rule as cmd_submit: an adoption whose
+        # record cannot be written is ledgered softly, logged
+        # loudly, and exits 6 (write-denial shape, retry later)
+        # instead of vanishing without a trace.
+        ledger_soft("submit_failed", job_id=job["id"], key=job["key"],
+                    program=job["program"], workflow=job["workflow"],
+                    context="adopt", error=str(exc)[:200])
+        hlog("SUBMIT_FAILED job=%s key=%s context=adopt error=%s"
+             % (job["id"], job["key"], exc))
+        print("ERROR: adoption %s could not be recorded: the queue "
+              "write did not verify (%s). The job is NOT tracked. "
+              "This is the write-denial failure shape (exit 6): "
+              "retry the adoption on the next cycle."
+              % (job["id"], exc))
+        return 6
     ledger("adopted", job_id=job["id"], key=job["key"],
            program=job["program"], workflow=job["workflow"],
            lane=job["lane"], run_id=job["run_id"])
