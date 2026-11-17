@@ -212,6 +212,12 @@ POWER_CONFIRM_DOWN_S = _CFG["power"]["confirm_down_s"]
 # (roaming / off_fleet) with NEEDS-PHYSICAL owners.
 DOWNTIME_ESCALATION_CHATS = list(
     _CFG["downtime"]["escalation_chats"])
+DOWNTIME_LADDER_BUDGET_S = _CFG["downtime"]["ladder_budget_s"]
+DOWNTIME_LADDER_BACKOFF_S = list(
+    _CFG["downtime"]["ladder_backoff_s"])
+DOWNTIME_SLOW_REPROBE_S = _CFG["downtime"]["slow_reprobe_s"]
+HOST_WOL = {n: dict(h["wol"]) for n, h in _CFG["hosts"].items()
+            if h.get("wol")}
 HOST_ROAMING = {n: bool(h.get("roaming"))
                 for n, h in _CFG["hosts"].items()}
 HOST_OFF_FLEET = {n: bool(h.get("off_fleet"))
@@ -3929,6 +3935,19 @@ def cmd_sweep(_args):
             except Exception as _exc:
                 ledger("power_pass_error", error=str(_exc)[:200])
                 hlog("POWER pass error: %s" % _exc)
+            # Recovery ladder (spec 042): one
+            # stage per open downtime record per sweep,
+            # plus the slow re-probe for flipped records.
+            # Contained the same way.
+            try:
+                _touched = ladder_pass(jobs)
+                if _touched:
+                    hlog("LADDER pass: touched %d record(s)"
+                         % _touched)
+            except Exception as _exc:
+                ledger("ladder_pass_error",
+                       error=str(_exc)[:200])
+                hlog("LADDER pass error: %s" % _exc)
             # Staging store (FBB-1): one pending-staging job per
             # sweep pass. A staging failure must never break the
             # fleet's only watcher, so the pass is fully contained.
@@ -5744,6 +5763,17 @@ def open_downtime(host, detector, evidence=None, note=None,
         "closed_at": None,
         "closing": None,
     }
+    if cls != "BY-ACTION":
+        # The recovery ladder (FR-014) arms at
+        # opening; ladder_pass runs its steps on the sweep
+        # cadence. BY-ACTION records never ladder — the
+        # action's own machinery owns that host's return.
+        rec["ladder_state"] = {
+            "started_at": rec["first_detected"], "stage": "start",
+            "backoff_idx": 0, "next_due": None,
+            "reboot_action": None, "wake_attempted": False,
+            "active_step": None, "first_probe": None,
+            "last_slow_reprobe": None}
     data["open"][host] = rec
     save_downtime(data)
     ledger("downtime_opened", host=host, record_id=rec["id"],
@@ -6674,6 +6704,495 @@ def power_pass(jobs=None):
                         % POWER_CONFIRM_DOWN_S)
                     settled += 1
     return settled
+
+
+# --- Wake-on-LAN (spec 042, FR-010) -----------------------------------------
+#
+# A host may carry a `wol` config block {mac, via,
+# enabled}: the `via` host — a fleet host resident on the
+# target's LAN — sends the magic packet. A wake is an
+# ATTEMPT: its verdict is only ever the target's
+# subsequent boot-back identity, never the send. The host
+# record keeps the standing distinct: CONFIGURED (a block
+# exists, never yet proven), PROVEN (a wake was followed
+# by the host's observed return), FAILED (a first attempt
+# was made and the host never returned inside the
+# incident — recorded, never silently retried as if
+# unconfigured). Owner ruling D2: fixed wired hosts only;
+# roaming hosts are wake-free by design even if a block is
+# written for one, and macOS has no wake step at all.
+
+def _wol_block(host):
+    if HOST_ROAMING.get(host) or HOST_TYPE.get(host) == "macos":
+        return None
+    block = HOST_WOL.get(host)
+    if not block or not block.get("enabled"):
+        return None
+    return block
+
+
+def _wol_stored(host):
+    state = load_hosts_state()
+    return (state.get(host) or {}).get("wol")
+
+
+def _set_wol(host, **kw):
+    state = load_hosts_state()
+    rec = _host_record(state, host)
+    w = rec.get("wol")
+    if not isinstance(w, dict):
+        w = {"state": "CONFIGURED", "attempts": [],
+             "proven_at": None, "failed_at": None}
+        rec["wol"] = w
+    w.update(kw)
+    save_hosts_state(state)
+    return w
+
+
+def wol_standing(host):
+    """CONFIGURED / PROVEN / FAILED / NOT-CONFIGURED for
+    one host, from its config block and its record."""
+    if _wol_block(host) is None:
+        return "NOT-CONFIGURED"
+    stored = _wol_stored(host)
+    if stored and stored.get("state"):
+        return stored["state"]
+    return "CONFIGURED"
+
+
+def _wol_send(host, block):
+    """Execute the send on the `via` host: a maintenance
+    job on the sender's own lane running a small python
+    sender (stdlib sockets — no wakeonlan dependency on
+    the sender). (ok, detail). Slice 2 ships the module
+    and its fixtures; live sends happen only when the
+    ladder or an operator runs it against a real incident
+    (the Phase 6 field legs)."""
+    via = block["via"]
+    if HOST_TYPE.get(via) != "linux":
+        return False, ("via host %s is not a Linux host — "
+                       "the sender build covers Linux senders"
+                       % via)
+    lanes = _host_lanes(via)
+    if not lanes:
+        return False, "via host %s has no lane" % via
+    mac = block["mac"]
+    script_name = "wol-send-%s.sh" % host
+    script_path = os.path.join(BASE, script_name)
+    script = (
+        "#!/bin/sh\n"
+        "python3 - @MAC@ <<'PYEOF'\n"
+        "import socket, sys\n"
+        "mac = sys.argv[1].replace(':', '')\n"
+        "pkt = b'\\xff' * 6 + bytes.fromhex(mac) * 16\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n"
+        "for _ in range(3):\n"
+        "    s.sendto(pkt, ('255.255.255.255', 9))\n"
+        "print('WOL_SENT mac=%s bytes=%d' % (sys.argv[1], len(pkt)))\n"
+        "PYEOF\n").replace("@MAC@", mac)
+    try:
+        _write_text_file(script_path, script)
+    except (IOError, OSError) as exc:
+        return False, "could not write the sender script (%s)" % exc
+    sub_args = types.SimpleNamespace(
+        key="gk-wol-%s-%s" % (host,
+                              now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        program="syncyard", workflow="linux.yml", lane=lanes[0],
+        script=script_path, grab_path=None, cwd=None, image=None,
+        mounts=None, expected_min=1.0, maintenance=True,
+        notify_chat=None)
+    rc = cmd_submit(sub_args)
+    if rc != 0:
+        return False, "sender job not accepted (submit rc=%d)" % rc
+    return True, "sender job queued on %s" % via
+
+
+def wol_attempt(host):
+    """One wake attempt for `host`. Returns (outcome,
+    detail): WOL-SENT, WOL-SEND-FAILED, or
+    WOL-NOT-CONFIGURED (no block, disabled, macOS, or a
+    roaming host — the ladder records it and moves on).
+    Every real attempt is logged with sender, target, and
+    time, on the ledger and the host record."""
+    block = _wol_block(host)
+    if block is None:
+        return "WOL-NOT-CONFIGURED", (
+            "no enabled wol block for %s (or the host is "
+            "excepted)" % host)
+    ok, detail = _wol_send(host, block)
+    w = _set_wol(host)
+    w.setdefault("attempts", []).append(
+        {"ts": now_iso(), "sender": block["via"], "ok": ok,
+         "detail": detail})
+    _set_wol(host, attempts=w["attempts"])
+    ledger("wol_attempt", host=host, via=block["via"],
+           mac=block["mac"], ok=ok)
+    hlog("WOL ATTEMPT host=%s via=%s ok=%s"
+         % (host, block["via"], ok))
+    return ("WOL-SENT" if ok else "WOL-SEND-FAILED"), detail
+
+
+def wol_note_return(host):
+    """The host returned after a wake attempt: a
+    CONFIGURED standing becomes PROVEN, with the time.
+    Called from the downtime close paths — the return is
+    the proof, per FR-010."""
+    stored = _wol_stored(host)
+    if stored and stored.get("state") == "CONFIGURED" \
+            and stored.get("attempts"):
+        _set_wol(host, state="PROVEN", proven_at=now_iso())
+        ledger("wol_proven", host=host, proven_at=now_iso())
+
+
+def wol_note_failed(host):
+    """A wake was attempted in an incident the host never
+    returned from: the standing becomes FAILED — recorded,
+    so no later step treats the host as merely
+    unconfigured."""
+    stored = _wol_stored(host)
+    if stored and stored.get("state") == "CONFIGURED" \
+            and stored.get("attempts"):
+        _set_wol(host, state="FAILED", failed_at=now_iso())
+        ledger("wol_failed", host=host, failed_at=now_iso())
+
+
+def cmd_wol(args):
+    """`gk wol --host <host>`: one wake attempt now, and
+    the host's wake standing printed either way."""
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    outcome, detail = wol_attempt(host)
+    print("WOL host=%s outcome=%s standing=%s — %s"
+          % (host, outcome, wol_standing(host), detail))
+    return 0 if outcome == "WOL-SENT" else 1
+
+
+# --- Recovery ladder (spec 042, FR-014 / FR-015) -----------------------------
+#
+# On a downtime record's opening (never for BY-ACTION,
+# never for the FR-016 exceptions beyond their limited
+# form), the ladder works the incident in order, lesser
+# steps first, every step logged to the record with its
+# evidence and timestamp: (1) re-probe all channels,
+# (2) wake where configured, (3) backoff re-probes at
+# +2/+5/+10 min, (4) the lesser stack restart over a
+# channel that proves the host alive, (5) ONE controlled
+# reboot over a proven-live route — never a second. The
+# total bound is downtime.ladder_budget_s; at expiry with
+# the host still down the record flips to NEEDS-PHYSICAL
+# (FR-015) and active steps stop; after the flip only the
+# slow re-probe runs. Recovery is claimed only on the
+# host's own identity (the FR-005 standard), never on
+# another channel's liveness alone. The ladder runs on
+# the sweep cadence (ladder_pass), one stage per pass, so
+# no sweep ever blocks on a wait.
+
+def _ladder_probe(host):
+    """One probe of every channel the gatekeeper can read
+    (the ladder's step-1 instrument, and the seam its
+    fixtures script). Channels with no gatekeeper-side
+    read today report None — unknown, never guessed:
+    the Syncyard agent channel and a LAN-resident prober
+    are host-side instruments whose readings arrive as
+    fleet facts, not gatekeeper reads."""
+    out = {"heartbeat_age_s": None, "runners_online": None,
+           "agent": None, "lan_reachable": None}
+    if host in heartbeat_hosts():
+        hb, _err = fetch_backchannel_heartbeat()
+        if hb is not None:
+            ts = parse_iso(hb.get("ts"))
+            if ts is not None:
+                out["heartbeat_age_s"] = (
+                    now_dt() - ts).total_seconds()
+    data, err = gh_json(["api", "repos/%s/actions/runners" % REPO])
+    if not err and isinstance(data, dict):
+        out["runners_online"] = len([
+            r for r in data.get("runners") or []
+            if str(r.get("name") or "").startswith(host)
+            and r.get("status") == "online"])
+    return out
+
+
+def _ladder_identity(host, rec, probe):
+    """(back, evidence): the host's OWN identity answers —
+    a heartbeat stamp newer than the incident's first
+    detection, or the host's runners observed offline at
+    the ladder's first probe and online now. Another
+    channel's liveness alone never closes an incident."""
+    state = load_hosts_state()
+    hb_ts = (state.get(host) or {}).get("last_heartbeat_ts")
+    if hb_ts and hb_ts > rec["first_detected"]:
+        return True, "heartbeat %s (after first detection)" % hb_ts
+    ls = rec.get("ladder_state") or {}
+    first = ls.get("first_probe") or {}
+    if first.get("runners_online") == 0 \
+            and (probe.get("runners_online") or 0) > 0:
+        return True, ("runners offline at first probe, %d "
+                      "online now" % probe["runners_online"])
+    return False, "no identity evidence"
+
+
+def _ladder_stack_restart(host):
+    """The ladder's step-4 instrument (FR-009's verb
+    surface). The on-host restart internals are spec
+    040's; until that surface lands, the step reports
+    itself unavailable — logged in the record, never
+    faked — and the ladder moves to its next step."""
+    return False, ("host-restart surface unbuilt: spec 040 "
+                   "owns the on-host restart internals")
+
+
+def _ladder_log(rec, step, outcome, evidence):
+    rec.setdefault("ladder", []).append(
+        {"step": step, "ts": now_iso(), "outcome": outcome,
+         "evidence": evidence})
+
+
+def _save_downtime_rec(rec):
+    data = load_downtime()
+    if rec["host"] in data["open"]:
+        data["open"][rec["host"]] = rec
+        save_downtime(data)
+
+
+def _ladder_flip(rec, why):
+    """Budget expiry with the host still down: log the
+    flip, mark a tried wake FAILED if it never proved,
+    and escalate (the one push)."""
+    _ladder_log(rec, "flip", "NEEDS-PHYSICAL", why)
+    _save_downtime_rec(rec)
+    if (rec.get("ladder_state") or {}).get("wake_attempted"):
+        wol_note_failed(rec["host"])
+    escalate_downtime(rec["host"], by="ladder")
+
+
+def _ladder_close_for(rec, probe):
+    """Judge a proven return: which closing, and does the
+    ladder get the credit? An active step's recovery is
+    RECOVERED-BY-LADDER with the step named; a return the
+    ladder only witnessed is RECOVERED-UNASSISTED."""
+    ls = rec.get("ladder_state") or {}
+    step = ls.get("active_step")
+    back, ev = _ladder_identity(rec["host"], rec, probe)
+    if not back:
+        return False
+    wol_note_return(rec["host"])
+    if step in ("wake", "lesser", "reboot"):
+        close_downtime(
+            rec["host"], "RECOVERED-BY-LADDER",
+            account="recovered at ladder step %s — %s"
+                    % ({"wake": "2 (wake)",
+                        "lesser": "4 (stack restart)",
+                        "reboot": "5 (controlled reboot)"}[step],
+                       ev))
+    else:
+        close_downtime(
+            rec["host"], "RECOVERED-UNASSISTED",
+            account="host answered on its own identity — %s"
+                    % ev)
+    return True
+
+
+def _ladder_host(rec, jobs):
+    host = rec["host"]
+    ls = rec.get("ladder_state")
+    if ls is None:
+        return
+    off_fleet = bool(HOST_OFF_FLEET.get(host))
+    probe = _ladder_probe(host)
+    if ls.get("first_probe") is None:
+        ls["first_probe"] = dict(probe)
+        _save_downtime_rec(rec)
+    if _ladder_close_for(rec, probe):
+        return
+    started = parse_iso(ls["started_at"])
+    budget_end = started + timedelta(
+        seconds=DOWNTIME_LADDER_BUDGET_S) if started else None
+    if budget_end is not None and now_dt() > budget_end:
+        _ladder_flip(rec, "ladder budget (%ss) expired with "
+                          "the host still down"
+                          % DOWNTIME_LADDER_BUDGET_S)
+        return
+    stage = ls["stage"]
+    if stage == "start":
+        if rec["state"] == "OPEN":
+            rec["state"] = "LADDER"
+        _ladder_log(rec, 1, "re-probed",
+                    "heartbeat_age_s=%s runners_online=%s "
+                    "agent=%s lan_reachable=%s"
+                    % (probe["heartbeat_age_s"],
+                       probe["runners_online"], probe["agent"],
+                       probe["lan_reachable"]))
+        if off_fleet:
+            _ladder_log(rec, 2, "skipped",
+                        "off-fleet: the ladder is re-probe only")
+            ls["wake_attempted"] = False
+        else:
+            outcome, detail = wol_attempt(host)
+            _ladder_log(rec, 2, outcome, detail)
+            ls["wake_attempted"] = outcome == "WOL-SENT"
+            if ls["wake_attempted"]:
+                ls["active_step"] = "wake"
+        ls["stage"] = "backoff"
+        ls["backoff_idx"] = 0
+        ls["next_due"] = (started + timedelta(
+            seconds=DOWNTIME_LADDER_BACKOFF_S[0])).strftime(
+                "%Y-%m-%dT%H:%M:%SZ") if started else None
+        _save_downtime_rec(rec)
+        return
+    if stage == "backoff":
+        due = parse_iso(ls.get("next_due") or "")
+        if due is None or now_dt() < due:
+            return
+        idx = ls["backoff_idx"]
+        _ladder_log(rec, 3, "re-probed",
+                    "backoff +%ss: heartbeat_age_s=%s "
+                    "runners_online=%s"
+                    % (DOWNTIME_LADDER_BACKOFF_S[idx],
+                       probe["heartbeat_age_s"],
+                       probe["runners_online"]))
+        idx += 1
+        ls["backoff_idx"] = idx
+        if idx >= len(DOWNTIME_LADDER_BACKOFF_S):
+            ls["stage"] = "lesser"
+        else:
+            ls["next_due"] = (started + timedelta(
+                seconds=DOWNTIME_LADDER_BACKOFF_S[idx])).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+        _save_downtime_rec(rec)
+        return
+    if stage == "lesser":
+        if off_fleet:
+            _ladder_log(rec, 4, "skipped",
+                        "off-fleet: no stack restart, no "
+                        "power verbs")
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+            return
+        alive = bool(probe.get("lan_reachable")
+                     or probe.get("agent"))
+        if not alive:
+            _ladder_log(rec, 4, "skipped",
+                        "no channel proves the host alive — "
+                        "a stack restart has no channel to "
+                        "ride")
+            ls["stage"] = "reboot"
+            _save_downtime_rec(rec)
+            return
+        ok, detail = _ladder_stack_restart(host)
+        _ladder_log(rec, 4, "restarted" if ok else "unavailable",
+                    detail)
+        if ok:
+            ls["active_step"] = "lesser"
+            _save_downtime_rec(rec)
+            probe2 = _ladder_probe(host)
+            if _ladder_close_for(rec, probe2):
+                return
+        ls["stage"] = "reboot"
+        _save_downtime_rec(rec)
+        return
+    if stage == "reboot":
+        if off_fleet:
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+            return
+        prec = {"id": new_job_id("power-reboot-%s" % host),
+                "host": host, "action": "reboot",
+                "requested_by": "downtime-ladder",
+                "confirmer": None, "override": None,
+                "drain_requested": False, "state": "OPEN",
+                "created_at": now_iso(), "scheduled_for": None,
+                "delay_s": REBOOT_GRACE_S, "route": None,
+                "drain": None, "going_down": None, "signal": None,
+                "signaled_at": None, "fire_at": None,
+                "expected_return_by": None, "down_since": None,
+                "observed_down_at": None, "cancel": None,
+                "cancel_attempts": [], "identity": None,
+                "verdict": None, "verdict_ts": None}
+        save_power_action(prec)
+        outcome, _rc = _power_execute(prec, jobs)
+        _ladder_log(rec, 5, outcome,
+                    "controlled reboot action %s (drain "
+                    "accounting in the action record)"
+                    % prec["id"])
+        if outcome == "signaled":
+            ls["reboot_action"] = prec["id"]
+            ls["active_step"] = "reboot"
+            ls["stage"] = "await-return"
+        else:
+            ls["stage"] = "flip-wait"
+        _save_downtime_rec(rec)
+        return
+    if stage == "await-return":
+        aid = ls.get("reboot_action")
+        arec = next((a for a in load_power_actions()
+                     if a["id"] == aid), None)
+        if arec is not None and arec.get("verdict") in (
+                "RETURN-MISSED", "UNVERIFIED", "REFUSED",
+                "UNREACHABLE"):
+            _ladder_log(rec, 5, "reboot-closed-%s"
+                        % arec["verdict"],
+                        "the controlled reboot did not bring "
+                        "the host back")
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+        return
+    # "flip-wait": nothing left but the budget, judged at
+    # the top of the next pass.
+
+
+def ladder_pass(jobs=None):
+    """Run the recovery ladder one stage per open record,
+    and the slow re-probe for flipped ones. Sweep-driven,
+    contained by the caller. Returns the number of records
+    touched."""
+    if jobs is None:
+        jobs = load_jobs()
+    touched = 0
+    for host in list(load_downtime()["open"].keys()):
+        rec = downtime_open_record(host)
+        if rec is None:
+            continue
+        try:
+            if rec["state"] == "NEEDS-PHYSICAL":
+                ls = rec.get("ladder_state") or {}
+                last = parse_iso(ls.get("last_slow_reprobe")
+                                 or rec.get("physical", {})
+                                 .get("flipped_at") or "")
+                if last is not None and (
+                        now_dt() - last).total_seconds() \
+                        < DOWNTIME_SLOW_REPROBE_S:
+                    continue
+                ls["last_slow_reprobe"] = now_iso()
+                rec["ladder_state"] = ls
+                _save_downtime_rec(rec)
+                probe = _ladder_probe(host)
+                back, ev = _ladder_identity(host, rec, probe)
+                _ladder_log(rec, "slow-reprobe",
+                            "returned" if back else "still-down",
+                            ev)
+                _save_downtime_rec(rec)
+                if back:
+                    wol_note_return(host)
+                    close_downtime(
+                        host, "RECOVERED-UNASSISTED",
+                        account="slow re-probe after "
+                                "NEEDS-PHYSICAL: %s" % ev)
+                touched += 1
+                continue
+            if rec.get("class") == "BY-ACTION" \
+                    or rec.get("ladder_state") is None:
+                continue
+            _ladder_host(rec, jobs)
+            touched += 1
+        except Exception as exc:
+            ledger_soft("ladder_error", host=host,
+                        error=str(exc)[:200])
+    return touched
 
 
 def cmd_profile(args):
@@ -7805,6 +8324,19 @@ def main(argv=None):
     p.add_argument("--requested-by", default=None,
                    help="chat id acting (recorded)")
     p.set_defaults(fn=cmd_downtime)
+
+    p = sub.add_parser("wol",
+                       help="wake-on-LAN (spec 042 FR-010): "
+                            "one wake attempt for a host via "
+                            "its configured LAN-resident "
+                            "sender, and the host's wake "
+                            "standing (CONFIGURED / PROVEN / "
+                            "FAILED / NOT-CONFIGURED). A wake "
+                            "is an attempt — it is proven only "
+                            "by the host's observed return")
+    p.add_argument("--host", required=True,
+                   help="config host name")
+    p.set_defaults(fn=cmd_wol)
 
     p = sub.add_parser("status")
     p.add_argument("--repo", action="store_true",

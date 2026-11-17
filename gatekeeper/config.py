@@ -116,7 +116,17 @@ DEFAULTS = {
     # push targets (in practice the one main chat). Empty
     # means unregistered: escalations still ledger, they
     # just push nowhere until the registration lands.
-    "downtime": {"escalation_chats": []},
+    # The recovery ladder's bounds (owner ruling
+    # 2026-11-17, decision D5, adopted as drafted):
+    # ladder_budget_s is the total bound before a record
+    # flips to NEEDS-PHYSICAL; ladder_backoff_s is the
+    # re-probe schedule after the wake step (+2/+5/+10
+    # min); slow_reprobe_s is the only automated act left
+    # after the flip.
+    "downtime": {"escalation_chats": [],
+                 "ladder_budget_s": 1800,
+                 "ladder_backoff_s": [120, 300, 600],
+                 "slow_reprobe_s": 3600},
     # Checkpoint hold: the cooperative
     # job-level pause contract. A dispatch passes each script
     # job the venue path of its per-job hold file (holds_dir
@@ -490,6 +500,27 @@ def validate(cfg):
             or not all(isinstance(c, str) and c for c in esc)):
         raise ConfigError(
             "downtime.escalation_chats must be a list of chat ids")
+    budget = dt.get("ladder_budget_s")
+    if (isinstance(budget, bool)
+            or not isinstance(budget, (int, float)) or budget <= 0):
+        raise ConfigError(
+            "downtime.ladder_budget_s must be a positive "
+            "number of seconds")
+    backoff = dt.get("ladder_backoff_s")
+    if (not isinstance(backoff, list) or not backoff
+            or not all(isinstance(x, (int, float))
+                       and not isinstance(x, bool) and x > 0
+                       for x in backoff)
+            or list(backoff) != sorted(backoff)):
+        raise ConfigError(
+            "downtime.ladder_backoff_s must be a non-empty "
+            "ascending list of positive seconds")
+    slow = dt.get("slow_reprobe_s")
+    if (isinstance(slow, bool)
+            or not isinstance(slow, (int, float)) or slow <= 0):
+        raise ConfigError(
+            "downtime.slow_reprobe_s must be a positive "
+            "number of seconds")
     ck = cfg.get("checkpoint") or {}
     code = ck.get("exit_code")
     if (isinstance(code, bool) or not isinstance(code, int)
@@ -591,6 +622,33 @@ def validate(cfg):
         if owner is not None and not (isinstance(owner, str) and owner):
             raise ConfigError(
                 f"hosts.{name}: physical_owner must be a non-empty string")
+        # Wake-on-LAN (spec 042 FR-010): an
+        # optional `wol` block {mac, via, enabled}. `via`
+        # is the LAN-resident fleet host that sends the
+        # magic packet; a block naming an unknown sender or
+        # a malformed MAC fails closed here, never at 3 a.m.
+        # in the ladder.
+        wol = host.get("wol")
+        if wol is not None:
+            if not isinstance(wol, dict):
+                raise ConfigError(f"hosts.{name}: wol must be a mapping")
+            mac = wol.get("mac")
+            if not (isinstance(mac, str) and re.fullmatch(
+                    r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", mac or "")):
+                raise ConfigError(
+                    f"hosts.{name}: wol.mac must be a MAC address "
+                    f"(aa:bb:cc:dd:ee:ff)")
+            if wol.get("via") not in hosts:
+                raise ConfigError(
+                    f"hosts.{name}: wol.via must name another "
+                    f"declared host (the LAN-resident sender)")
+            if wol.get("via") == name:
+                raise ConfigError(
+                    f"hosts.{name}: wol.via cannot be the host "
+                    f"itself")
+            if not isinstance(wol.get("enabled"), bool):
+                raise ConfigError(
+                    f"hosts.{name}: wol.enabled must be a boolean")
         if host.get("type") == "wsl2":
             via_wf = (hosts.get(host.get("via")) or {}).get("workflows") or {}
             for wname, kind in wf.items():

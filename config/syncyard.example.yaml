@@ -98,6 +98,14 @@ power:
 # registration lands.
 downtime:
   escalation_chats: []
+  # The recovery ladder's bounds (defaults ratified
+  # 2026-11-17): the total budget before a record flips
+  # to NEEDS-PHYSICAL, the re-probe backoff schedule
+  # after the wake step, and the slow re-probe cadence
+  # that is the only automated act left after the flip.
+  ladder_budget_s: 1800
+  ladder_backoff_s: [120, 300, 600]
+  slow_reprobe_s: 3600
 
 # Checkpoint hold. The cooperative job-level
 # pause contract: at dispatch each script job is passed the
@@ -181,6 +189,14 @@ lock:
 # escalation for the host goes to (default: the fleet
 # owner). Removing a host from an exception set is a config
 # change with the owner's name on it, never a default.
+# A host may also carry a `wol` block (spec 042 FR-010):
+# {mac: "aa:bb:cc:dd:ee:ff", via: <the LAN-resident fleet
+# host that sends the magic packet>, enabled: true}. The
+# host record distinguishes CONFIGURED from PROVEN (the
+# first observed wake) and records a failed first attempt
+# as FAILED. Wake-free by design (owner ruling 2026-11-17):
+# the roaming hosts carry no wol block, and macOS has no
+# wake step at all.
 hosts:
   desktop:
     type: windows
