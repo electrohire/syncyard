@@ -34,6 +34,15 @@ Covers:
     one push on escalate, main chat only), the FR-016
     hard exceptions, sweep detection open/close, and the
     outbox rendering of the escalation push.
+  - amendment 2026-11-17 (field leg A): the Linux signal
+    and abort bodies ride `sudo -n` only, verify the
+    scheduled state, and carry POWER_SIGNAL verdict
+    markers with no unconditional exit 0 (executed
+    against stub sudoes: refusal, acceptance, accepted-
+    but-unscheduled, no-sudo, abort shapes); the record's
+    signal.ok comes from the signal job's harvested
+    payload verdict at the sweep settle (OK / FAIL /
+    MISSING), never from queueing.
 
 Run: python3 gatekeeper/test_spec042.py
 """
@@ -372,9 +381,11 @@ check("poweroff: DOWN-BY-ACTION and the remote-poweroff "
       "signal seam runs",
       res["seen"] == {"power_state": "DOWN-BY-ACTION",
                       "gd_trigger": "remote-poweroff"}, str(res))
-check("poweroff: the Linux signal body is the cancellable "
-      "shutdown -h +2 form for a 120 s grace",
-      "shutdown -h +2" in res["body"], str(res))
+check("poweroff: the Linux signal body is the privileged, "
+      "cancellable sudo -n shutdown -h +2 form for a 120 s "
+      "grace (amendment 2026-11-17)",
+      "sudo -n /usr/sbin/shutdown -h +2" in res["body"],
+      str(res))
 check("poweroff: silence inside the window sets down_since "
       "with no verdict; a full 180 s of silence closes "
       "CONFIRMED-DOWN and the host stays DOWN-BY-ACTION",
@@ -516,11 +527,14 @@ print(json.dumps({
     "issues_open": len(gk._open_power_actions()),
 }))
 """)
-check("reboot: a delay-0 Linux signal is systemctl reboot; "
-      "a host merely up does NOT verify (no down observed), "
-      "silence arms the return, and the next proof closes "
-      "VERIFIED on the interim identity, named as such",
-      res["rc"] == 0 and "systemctl reboot" in res["body"]
+check("reboot: a delay-0 Linux signal is systemctl reboot "
+      "through the privileged route (sudo -n, amendment "
+      "2026-11-17); a host merely up does NOT verify (no "
+      "down observed), silence arms the return, and the "
+      "next proof closes VERIFIED on the interim identity, "
+      "named as such",
+      res["rc"] == 0
+      and "sudo -n /usr/bin/systemctl reboot" in res["body"]
       and res["early_verdict"] is None
       and res["mid_verdict"] is None and res["mid_down"]
       and res["verdict"] == "VERIFIED" and res["identity"]
@@ -600,11 +614,12 @@ print(json.dumps({
 }))
 """)
 check("cancel: an in-grace action takes the OS abort "
-      "(shutdown -c on Linux) and settles CANCELLING; a host "
+      "(the privileged sudo -n shutdown -c on Linux, "
+      "amendment 2026-11-17) and settles CANCELLING; a host "
       "observed up past the fire time closes "
       "CANCELLED-CONFIRMED",
       res["rc2"] == 0 and res["state"] == "CANCELLING"
-      and "shutdown -c" in res["abort_body"]
+      and "sudo -n /usr/sbin/shutdown -c" in res["abort_body"]
       and res["verdict"] == "CANCELLED-CONFIRMED", str(res))
 
 res = run_driver(r"""
@@ -1162,6 +1177,263 @@ check("ladder: after NEEDS-PHYSICAL the only automated "
       "notices the return",
       res["early_open"] and res["closed"] == ["RECOVERED-UNASSISTED"]
       and "slow re-probe" in res["account"], str(res))
+
+# --- Amendment 2026-11-17: the privileged signal route ---------------------
+# Field leg A (tower-offsite, 2026-11-17) proved the first
+# Linux signal body defective: it ran `shutdown` as the
+# unprivileged runner account, logind refused it
+# ("Interactive authentication required"), nothing was
+# scheduled, and the body's unconditional `exit 0` reported
+# success anyway; the record had marked signal.ok on mere
+# queueing. The checks below pin the amended shape.
+
+res = run_driver(r"""
+rc, _ = power(delay=120)
+a = actions()[-1]
+body = script_of(signal_jobs()[-1])
+rc2, _ = power(action="cancel")
+a2 = actions()[-1]
+ab = [script_of(j) for j in signal_jobs()
+      if "abort" in str(j.get("key"))]
+print(json.dumps({
+    "body": body,
+    "sig_ok": a["signal"]["ok"],
+    "sig_verdict": a["signal"]["verdict"],
+    "job_key": bool(a["signal"].get("job_key")),
+    "abort_body": ab[-1] if ab else "",
+    "abort_ok": (a2.get("cancel") or {}).get("abort_ok"),
+    "abort_job_key": bool((a2.get("cancel") or {})
+                          .get("abort_job_key")),
+}))
+""")
+check("amendment: the delayed Linux signal body invokes "
+      "through sudo -n, carries the POWER_SIGNAL verdict "
+      "markers, and does not end in an unconditional exit 0",
+      "sudo -n /usr/sbin/shutdown -r +2" in res["body"]
+      and "POWER_SIGNAL_VERDICT" in res["body"]
+      and "POWER_SIGNAL_DETAIL" in res["body"]
+      and not res["body"].rstrip().endswith("exit 0"),
+      str(res))
+check("amendment: queueing is not a verdict — a freshly "
+      "signaled record carries signal.ok None, no signal "
+      "verdict, and the signal job's key for the settle",
+      res["sig_ok"] is None and res["sig_verdict"] is None
+      and res["job_key"], str(res))
+check("amendment: the abort body rides the same privileged "
+      "route with the same markers, and its queued state is "
+      "likewise verdict-pending, never ok-on-queue",
+      "sudo -n /usr/sbin/shutdown -c" in res["abort_body"]
+      and "POWER_SIGNAL_VERDICT" in res["abort_body"]
+      and res["abort_ok"] is None and res["abort_job_key"],
+      str(res))
+
+# The bodies themselves, executed against stub sudoes. The
+# scheduled-shutdown file is redirected through the body's
+# POWER_SIGNAL_SCHEDULED_FILE seam; the stub sudo plays
+# logind's half (recording the schedule) or refuses.
+res = run_driver(r"""
+import subprocess
+BIN = os.path.join(BASE_DIR, "stubbin")
+os.makedirs(BIN, exist_ok=True)
+SD = os.path.join(BASE_DIR, "scheduled-file")
+
+def stub_sudo(text):
+    p = os.path.join(BIN, "sudo")
+    with open(p, "w") as f:
+        f.write(text)
+    os.chmod(p, 0o755)
+
+def run_body(body, with_sudo=True, pre_file=False):
+    if os.path.exists(SD):
+        os.unlink(SD)
+    if pre_file:
+        with open(SD, "w") as f:
+            f.write("USEC=1\nMODE=reboot\n")
+    env = dict(os.environ)
+    env["PATH"] = (BIN + os.pathsep + "/usr/bin:/bin") \
+        if with_sudo else "/nonexistent-power-test"
+    env["POWER_SIGNAL_SCHEDULED_FILE"] = SD
+    r = subprocess.run(["/bin/sh", "-c", body],
+                       capture_output=True, text=True, env=env)
+    return r.returncode, r.stdout
+
+sig = gk._power_body("tower", "reboot", 60)
+stub_sudo("#!/bin/sh\n"
+          "echo 'sudo: a password is required' >&2\n"
+          "exit 1\n")
+rc_a, out_a = run_body(sig)
+stub_sudo("#!/bin/sh\n"
+          "printf 'USEC=1\\nMODE=reboot\\n' > "
+          "\"$POWER_SIGNAL_SCHEDULED_FILE\"\n"
+          "exit 0\n")
+rc_b, out_b = run_body(sig)
+stub_sudo("#!/bin/sh\nexit 0\n")
+rc_c, out_c = run_body(sig)
+rc_d, out_d = run_body(sig, with_sudo=False)
+abort = gk._power_abort_body("tower")
+stub_sudo("#!/bin/sh\n"
+          "rm -f \"$POWER_SIGNAL_SCHEDULED_FILE\"\n"
+          "exit 0\n")
+rc_e, out_e = run_body(abort, pre_file=True)
+stub_sudo("#!/bin/sh\nexit 0\n")
+rc_f, out_f = run_body(abort, pre_file=True)
+print(json.dumps({
+    "a": [rc_a, out_a], "b": [rc_b, out_b],
+    "c": [rc_c, out_c], "d": [rc_d, out_d],
+    "e": [rc_e, out_e], "f": [rc_f, out_f],
+}))
+""")
+check("amendment, simulated refusal: a sudo that denies "
+      "(the drop-in is missing) produces POWER_SIGNAL_"
+      "VERDICT FAIL and a non-zero exit — the field leg A "
+      "shape, now loud instead of hidden",
+      res["a"][0] != 0
+      and "POWER_SIGNAL_VERDICT FAIL" in res["a"][1]
+      and "refused" in res["a"][1], str(res))
+check("amendment, simulated acceptance: sudo accepts and "
+      "the scheduled state stands with MODE=reboot — "
+      "VERDICT OK, exit 0",
+      res["b"][0] == 0
+      and "POWER_SIGNAL_VERDICT OK" in res["b"][1], str(res))
+check("amendment, accepted but unscheduled: rc=0 from "
+      "shutdown with no scheduled state is a FAIL, not a "
+      "pass — acceptance is not scheduling",
+      res["c"][0] != 0
+      and "POWER_SIGNAL_VERDICT FAIL" in res["c"][1]
+      and "did not take" in res["c"][1], str(res))
+check("amendment, no sudo on the host: the body refuses "
+      "to run at all rather than falling back to the "
+      "unprivileged call",
+      res["d"][0] != 0
+      and "POWER_SIGNAL_VERDICT FAIL" in res["d"][1]
+      and "sudo is not installed" in res["d"][1], str(res))
+check("amendment, abort body: a cancel that clears the "
+      "scheduled state verifies OK; one that leaves it "
+      "standing FAILs",
+      res["e"][0] == 0
+      and "POWER_SIGNAL_VERDICT OK" in res["e"][1]
+      and res["f"][0] != 0
+      and "POWER_SIGNAL_VERDICT FAIL" in res["f"][1]
+      and "still stands" in res["f"][1], str(res))
+
+SETTLE_PRELUDE = r"""
+def complete_job(key_part, markers, conclusion):
+    jobs = gk.load_jobs()
+    j = [x for x in jobs
+         if key_part in str(x.get("key") or "")][-1]
+    j["state"] = "completed"
+    j["run_conclusion"] = conclusion
+    j["markers"] = markers
+    gk.save_job(j)
+"""
+
+res = run_driver(SETTLE_PRELUDE + r"""
+rc, _ = power(delay=60)
+a = actions()[-1]
+complete_job("gk-power-", [
+    "POWER_SIGNAL_VERDICT FAIL",
+    "POWER_SIGNAL_DETAIL sudo -n /usr/sbin/shutdown -r +1 "
+    "refused (rc=1): sudo: a password is required"],
+    "failure")
+gk.power_pass()
+done = actions()[-1]
+print(json.dumps({
+    "pending_ok": a["signal"]["ok"],
+    "verdict": done["verdict"],
+    "sig_ok": done["signal"]["ok"],
+    "sig_verdict": done["signal"]["verdict"],
+    "detail": done.get("verdict_detail") or "",
+}))
+""")
+check("amendment, settle FAIL: a harvested FAIL marker "
+      "closes the action UNVERIFIED at once, with the "
+      "payload's own detail on the record — no waiting out "
+      "the return window for a refused signal",
+      res["pending_ok"] is None
+      and res["verdict"] == "UNVERIFIED"
+      and res["sig_ok"] is False
+      and res["sig_verdict"] == "FAIL"
+      and "signal payload verdict FAIL" in res["detail"]
+      and "a password is required" in res["detail"],
+      str(res))
+
+res = run_driver(SETTLE_PRELUDE + r"""
+rc, _ = power(delay=60)
+complete_job("gk-power-", [
+    "POWER_SIGNAL_VERDICT OK",
+    "POWER_SIGNAL_DETAIL scheduled shutdown verified"],
+    "success")
+gk.power_pass()
+mid = actions()[-1]
+BACK[0] = False
+advance(61)
+gk.power_pass()
+BACK[0] = True
+gk.power_pass()
+done = actions()[-1]
+print(json.dumps({
+    "mid_ok": mid["signal"]["ok"],
+    "mid_sig_verdict": mid["signal"]["verdict"],
+    "mid_open": mid["verdict"] is None,
+    "verdict": done["verdict"],
+}))
+""")
+check("amendment, settle OK: a harvested OK marker sets "
+      "signal.ok from the payload verdict, and the closing "
+      "verdict still comes from observed silence + return "
+      "(VERIFIED), not from the marker",
+      res["mid_ok"] is True
+      and res["mid_sig_verdict"] == "OK"
+      and res["mid_open"] and res["verdict"] == "VERIFIED",
+      str(res))
+
+res = run_driver(SETTLE_PRELUDE + r"""
+rc, _ = power(delay=60)
+complete_job("gk-power-", [], "success")
+gk.power_pass()
+done = actions()[-1]
+print(json.dumps({
+    "verdict": done["verdict"],
+    "sig_ok": done["signal"]["ok"],
+    "sig_verdict": done["signal"]["verdict"],
+    "detail": done.get("verdict_detail") or "",
+}))
+""")
+check("amendment, settle MISSING: a signal job that "
+      "concludes success with no verdict marker is "
+      "unproven and closes UNVERIFIED — success is never "
+      "inferred from the wrapper again",
+      res["verdict"] == "UNVERIFIED"
+      and res["sig_ok"] is False
+      and res["sig_verdict"] == "MISSING"
+      and "without a POWER_SIGNAL_VERDICT" in res["detail"],
+      str(res))
+
+res = run_driver(SETTLE_PRELUDE + r"""
+power(delay=300)
+power(action="cancel")
+complete_job("abort", [
+    "POWER_SIGNAL_VERDICT OK",
+    "POWER_SIGNAL_DETAIL abort verified: no scheduled "
+    "shutdown stands"], "success")
+gk.power_pass()
+mid = actions()[-1]
+BACK[0] = True
+advance(300)
+gk.power_pass()
+done = actions()[-1]
+print(json.dumps({
+    "abort_verdict": (mid.get("cancel") or {})
+                     .get("abort_verdict"),
+    "verdict": done["verdict"],
+}))
+""")
+check("amendment, abort settle: the abort job's payload "
+      "verdict is recorded on the record, and the cancel "
+      "verdict still settles from observed state "
+      "(CANCELLED-CONFIRMED), never from the abort marker",
+      res["abort_verdict"] == "OK"
+      and res["verdict"] == "CANCELLED-CONFIRMED", str(res))
 
 print()
 if fails:

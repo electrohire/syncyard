@@ -230,6 +230,24 @@ proves.
   *This does not establish* that a signaled host obeyed —
   obedience is FR-005's boot-back / confirmed-down verdict,
   and a signal without it closes as UNVERIFIED, not DONE.
+  **Amendment 2026-11-17 (field leg A finding; tasks
+  T017-A)**: the Linux signal layer as first built was
+  itself a "signal sent" claim — the maintenance body ran
+  `shutdown` as the unprivileged runner account, logind
+  refused it, and the body's unconditional `exit 0` hid
+  the refusal (the leg's record closed UNVERIFIED; the
+  verdict machinery caught what the signal layer hid).
+  The Linux bodies now invoke only through `sudo -n`
+  under the scoped drop-in shipped at
+  `gatekeeper/power-actions/sudoers-syncyard-power`,
+  verify the scheduled state at
+  `/run/systemd/shutdown/scheduled` before claiming OK,
+  print POWER_SIGNAL_VERDICT / POWER_SIGNAL_DETAIL
+  markers, and exit non-zero on any failure; the
+  record's signal.ok is set only from the signal job's
+  harvested payload verdict, never from queueing. The
+  immediate (delay 0) Linux shape keeps systemctl,
+  through the same privileged route.
 
 - **FR-002 — Power-off is a first-class action, gated
   harder than reboot.**

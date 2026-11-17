@@ -1,0 +1,43 @@
+# syncyard-power — scoped sudo for the Syncyard gatekeeper's
+# Linux power signals (spec 042 FR-001; amendment 2026-11-17
+# after field leg A).
+#
+# Why this exists: the gatekeeper's Linux power signal bodies
+# run as the runner account inside linux.yml maintenance jobs.
+# Field leg A (2026-11-17, tower-offsite) proved that an
+# unprivileged `shutdown` from that account is refused by
+# logind ("Interactive authentication required") — nothing is
+# scheduled. The amended bodies therefore invoke ONLY through
+# `sudo -n`, and this drop-in is the whole of the privilege
+# they get:
+#
+#   sudo -n /usr/sbin/shutdown -r|-h +<minutes> "Syncyard gatekeeper power"
+#   sudo -n /usr/sbin/shutdown -c                       (cancel)
+#   sudo -n /usr/bin/systemctl reboot                   (immediate)
+#   sudo -n /usr/bin/systemctl poweroff                 (immediate)
+#
+# /usr/sbin/shutdown is granted with any arguments (the
+# bodies use exactly the forms above); the systemctl entries
+# are pinned to the single argument each body uses. Nothing
+# else is granted. Without this drop-in the signal body
+# fails loudly by design — there is no unprivileged
+# fallback.
+#
+# Install on each wave-1 Linux host BEFORE its first live
+# power action:
+#   1. Replace SYNCYARD_RUNNER_ACCOUNT below with the
+#      account the host's linux.yml runner jobs run as.
+#      On the tower-compute and tower-offsite lanes that
+#      account is 'runner'; check per host — a host whose
+#      runners were enrolled under another name needs its
+#      own name here.
+#   2. sudo install -o root -g root -m 0440 \
+#        sudoers-syncyard-power /etc/sudoers.d/syncyard-power
+#   3. sudo visudo -cf /etc/sudoers.d/syncyard-power
+#      (must parse clean before the file is relied on)
+#   4. Prove it AS the runner account, non-destructively:
+#        sudo -n -l /usr/sbin/shutdown
+#      must list the command. A password prompt or a
+#      refusal means the drop-in is not in effect — do not
+#      live-fire a power action on that host.
+SYNCYARD_RUNNER_ACCOUNT ALL=(root) NOPASSWD: /usr/sbin/shutdown, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff
