@@ -715,6 +715,13 @@ proves.
    **Recommendation: close it as moot for now**; it reopens
    automatically if a Windows host rejoins or the guard
    deploy (spec 011 T008) is revived.
+   **DECISION LOG — RULED 2026-11-17 (owner, Syncyard
+   chat): CLOSED AS MOOT**, on the recommendation as
+   written. Reopening condition unchanged: a Windows host
+   rejoins the fleet, or the guard deploy (spec 011 T008)
+   is revived. This closes spec 011's last open design
+   question; the guard's build/deploy tasks stay spec
+   011's and stay dormant.
 2. **Wake-on-LAN enablement.** WoL needs per-host firmware
    posture (BIOS wake enable), a wired NIC path, and a
    LAN-resident sender. laptop-bench's wired NIC lives on

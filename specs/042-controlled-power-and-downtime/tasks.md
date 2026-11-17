@@ -14,10 +14,11 @@ currency in the same change as behavior (FR-019), and the
 rails of FR-017/FR-018.
 
 ## Phase 0 — Owner decisions (gate, before build)
-- [ ] D1 Spec 011 FR-005-A restart-vs-shutdown re-issue:
-      close as moot (recommendation in spec) or ratify as
-      designed. Dormant either way — no Windows host, guard
-      undeployed.
+- [x] D1 Spec 011 FR-005-A restart-vs-shutdown re-issue:
+      **RULED by the owner 2026-11-17: CLOSED AS MOOT.**
+      Reopens automatically if a Windows host rejoins the
+      fleet or the Windows shutdown guard (spec 011 T008)
+      is deployed. Recorded in spec.md's decision log.
 - [ ] D2 Wake-on-LAN scope: fixed wired hosts only, each
       proven-or-recorded-failed (recommendation), or defer
       WoL entirely to a later wave.
