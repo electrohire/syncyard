@@ -19,9 +19,13 @@ rails of FR-017/FR-018.
       Reopens automatically if a Windows host rejoins the
       fleet or the Windows shutdown guard (spec 011 T008)
       is deployed. Recorded in spec.md's decision log.
-- [ ] D2 Wake-on-LAN scope: fixed wired hosts only, each
-      proven-or-recorded-failed (recommendation), or defer
-      WoL entirely to a later wave.
+- [x] D2 Wake-on-LAN scope: **RULED by the owner
+      2026-11-17: FIXED WIRED HOSTS ONLY** (tower-compute,
+      tower-offsite, sbc-inference, mini-server as
+      candidates, each proven or recorded failed at first
+      attempt); laptop-bench and air-inference stay
+      wake-free by design. Recorded in spec.md's decision
+      log.
 - [ ] D3 First rollout wave: tower-compute, tower-offsite,
       sbc-inference; mini-server second (recommendation).
 - [ ] D4 Downtime push set: four chats × open/escalate/close

@@ -734,6 +734,12 @@ proves.
    air-inference stay wake-free by design.** The alternative
    — deferring WoL entirely — leaves the ladder's step 2
    empty in wave 1, which the ladder tolerates by design.
+   **DECISION LOG — RULED 2026-11-17 (owner, Syncyard
+   chat): ADOPTED AS RECOMMENDED.** WoL scope is fixed
+   wired hosts only (tower-compute, tower-offsite,
+   sbc-inference, mini-server as candidates, each proven or
+   recorded failed at first attempt); laptop-bench and
+   air-inference stay wake-free by design.
 3. **First rollout wave.** **Recommendation: tower-compute,
    tower-offsite, sbc-inference** (fixed Linux hosts with
    live agent channels) for the field legs and first
