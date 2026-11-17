@@ -34,12 +34,21 @@ rails of FR-017/FR-018.
       spec.md's decision log. (T020's premise changes with
       this ruling: mini-server is a wave-1 host, not a
       second-wave join.)
-- [ ] D4 Downtime push set: four chats × open/escalate/close
-      (recommendation), or main chat escalations-only.
-- [ ] D5 Defaults ratification: return window 900 s,
-      confirm-down 180 s, ladder budget 1800 s, backoff
-      +2/+5/+10 min, slow re-probe 3600 s (recommendation:
-      adopt as drafted).
+- [x] D4 Downtime push set: **RULED by the owner
+      2026-11-17: the NARROW set** — pushes go to the main
+      chat on escalation only (NEEDS-PHYSICAL); open and
+      close are record-only, and the Syncyard chat, Fleet
+      umbrella, and machine chats receive no downtime
+      pushes. This overrules FR-013's four-chat push as
+      drafted; recorded in spec.md's decision log.
+      (T011's scope narrows with it: one escalation
+      registration, one push per escalation.)
+- [x] D5 Defaults ratification: **RULED by the owner
+      2026-11-17: ADOPTED AS DRAFTED** (return window
+      900 s, confirm-down 180 s, ladder budget 1800 s,
+      backoff +2/+5/+10 min, slow re-probe 3600 s).
+      Recorded in spec.md's decision log. The decision
+      queue is now complete (D1–D5 all ruled).
 
 ## Phase 1 — The power verb family (FR-001–FR-004, FR-007)
 - [ ] T001 `gk power --host --action reboot|poweroff|cancel`

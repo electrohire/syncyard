@@ -498,7 +498,11 @@ proves.
   record's evidence lines are the whole basis.
 
 - **FR-013 — The fleet is told, once per transition, in
-  four places.**
+  four places.** *(Push scope narrowed by the owner's
+  2026-11-17 ruling, decision 4 below: pushes go to the
+  main chat on ESCALATION ONLY; open and close are
+  record-only. The ruling governs where it differs from
+  the text below.)*
   *Behavior*: opening a record, flipping to NEEDS-PHYSICAL,
   and closing a record each produce exactly one outbox push
   to each of: the Syncyard chat (owner of record), the Fleet
@@ -761,11 +765,26 @@ proves.
    reads first. The narrower alternative (main chat gets
    escalations only) is named in case alarm volume argues
    otherwise after the first real incidents.
+   **DECISION LOG — RULED 2026-11-17 (owner, Syncyard
+   chat): the NARROW push set is adopted, overruling the
+   four-chat push as drafted.** Pushes go to the MAIN
+   CHAT ON ESCALATION ONLY (ladder exhausted /
+   NEEDS-PHYSICAL); open and close transitions are
+   written to the record but NOT pushed, and the Syncyard
+   chat, Fleet umbrella, and machine chats receive no
+   downtime pushes. The record itself stays fleet-visible
+   in the gatekeeper state (`gk status`, the snapshot).
 5. **Defaults ratification.** `power.return_window_s` 900,
    `power.confirm_down_s` 180, `downtime.ladder_budget_s`
    1800, backoff +2/+5/+10 min, slow re-probe 3600.
    **Recommendation: adopt as drafted**; all are config, and
    the first field legs are the evidence to tune them by.
+   **DECISION LOG — RULED 2026-11-17 (owner, Syncyard
+   chat): ADOPTED AS DRAFTED** (return window 900 s,
+   confirm-down 180 s, ladder budget 1800 s, backoff
+   +2/+5/+10 min, slow re-probe 3600 s). With this ruling
+   the decision queue is complete: all five decisions
+   (D1–D5) are ruled.
 
 ## Non-goals
 
