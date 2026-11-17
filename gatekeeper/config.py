@@ -107,15 +107,16 @@ DEFAULTS = {
     # window, before it closes CONFIRMED-DOWN.
     "power": {"return_window_s": 900, "confirm_down_s": 180},
     # Fleet downtime records (spec 042): the
-    # standing notify registrations every downtime state
-    # transition (open / NEEDS-PHYSICAL / close) pushes to,
-    # exactly once per target. notify_chats names the
-    # fleet-wide targets (the Syncyard chat, the Fleet
-    # umbrella chat, the main chat); host_chats maps a host
-    # to its own machine chat. Empty means unregistered: the
-    # record still opens and ledgers, it just pushes nowhere
-    # until the registrations land.
-    "downtime": {"notify_chats": [], "host_chats": {}},
+    # escalation push registration. Owner ruling 2026-11-17
+    # (decision D4): downtime pushes go to the main chat on
+    # ESCALATION ONLY (a record's flip to NEEDS-PHYSICAL);
+    # open and close transitions are written to the record
+    # and the ledger but never pushed, and no other chat
+    # receives downtime pushes. escalation_chats names the
+    # push targets (in practice the one main chat). Empty
+    # means unregistered: escalations still ledger, they
+    # just push nowhere until the registration lands.
+    "downtime": {"escalation_chats": []},
     # Checkpoint hold: the cooperative
     # job-level pause contract. A dispatch passes each script
     # job the venue path of its per-job hold file (holds_dir
@@ -484,17 +485,11 @@ def validate(cfg):
             raise ConfigError(
                 f"power.{pkey} must be a positive number of seconds")
     dt = cfg.get("downtime") or {}
-    notify = dt.get("notify_chats")
-    if (not isinstance(notify, list)
-            or not all(isinstance(c, str) and c for c in notify)):
+    esc = dt.get("escalation_chats")
+    if (not isinstance(esc, list)
+            or not all(isinstance(c, str) and c for c in esc)):
         raise ConfigError(
-            "downtime.notify_chats must be a list of chat ids")
-    host_chats = dt.get("host_chats")
-    if (not isinstance(host_chats, dict)
-            or not all(isinstance(k, str) and isinstance(v, str) and v
-                       for k, v in host_chats.items())):
-        raise ConfigError(
-            "downtime.host_chats must map host names to chat ids")
+            "downtime.escalation_chats must be a list of chat ids")
     ck = cfg.get("checkpoint") or {}
     code = ck.get("exit_code")
     if (isinstance(code, bool) or not isinstance(code, int)
@@ -606,11 +601,6 @@ def validate(cfg):
     for wname in declared:
         if wname not in served:
             raise ConfigError(f"workflows: {wname!r} is served by no host")
-    for hname in ((cfg.get("downtime") or {}).get("host_chats") or {}):
-        if hname not in hosts:
-            raise ConfigError(
-                f"downtime.host_chats: host {hname!r} is not a "
-                f"declared host")
     # lanes live in named profiles.
     # Validation is fail-closed over the whole table — every
     # profile, active or not — and the pre-016 flat shape
