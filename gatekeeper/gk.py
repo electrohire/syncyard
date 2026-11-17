@@ -5287,26 +5287,30 @@ def _drain_probe(tracked):
         watch_pass(tracked, runs)
 
 
-def cmd_drain(args):
-    host = args.host
-    if host not in _CFG["hosts"]:
-        print("ERROR: unknown host '%s' (config hosts: %s)"
-              % (host, ", ".join(sorted(_CFG["hosts"]))))
-        return 2
-    jobs = load_jobs()
+def _drain_host(host, requested_by, window=None, jobs=None):
+    """The host drain itself (spec 011 Phase 2),
+    shared by `gk drain` and the spec 042 power verb:
+    signal the tracked jobs' checkpoint holds, set the
+    host's drain hold, wait out the per-lane windows, and
+    return the verdict as data. The ledger pair
+    (host_drain_started / host_drain_verdict) is written
+    here, exactly as `gk drain` has always written it; the
+    caller renders the verdict in its own words."""
+    if jobs is None:
+        jobs = load_jobs()
     tracked = _drain_tracked_jobs(host, jobs)
     lanes = set(_host_lanes(host))
     queued = [j for j in jobs if j.get("lane") in lanes
               and j["state"] == "submitted"
               and not j.get("maintenance")]
     started = now_iso()
-    if args.window is not None:
-        windows = {j["id"]: float(args.window) for j in tracked}
+    if window is not None:
+        windows = {j["id"]: float(window) for j in tracked}
     else:
         windows = {j["id"]: float(drain_window_for_lane(j["lane"]))
                    for j in tracked}
     ledger("host_drain_started", host=host,
-           requested_by=args.requested_by, tracked=len(tracked),
+           requested_by=requested_by, tracked=len(tracked),
            queued_waiting=len(queued))
     hlog("HOST_DRAIN host=%s tracked=%d at %s"
          % (host, len(tracked), started))
@@ -5332,7 +5336,7 @@ def cmd_drain(args):
     rec = _host_record(state, host)
     rec["drain_hold"] = True
     rec["drain_since"] = started
-    rec["drain_by"] = args.requested_by
+    rec["drain_by"] = requested_by
     save_hosts_state(state)
     # 3. Wait out the windows. Each tracked job is classified
     # at its own lane's deadline: checkpointed
@@ -5365,7 +5369,7 @@ def cmd_drain(args):
                 outcomes[j["id"]] = "uncheckpointed"
             break
         time.sleep(DRAIN_POLL_S if DRAIN_POLL_S > 0 else 0.05)
-    # 4. The verdict, in plain language.
+    # 4. The verdict, as data.
     by_id = {j["id"]: j for j in tracked}
     checkpointed = [i for i, o in outcomes.items()
                     if o == "held_at_checkpoint"]
@@ -5379,6 +5383,40 @@ def cmd_drain(args):
            checkpointed=checkpointed, finished=finished,
            ended=ended, uncheckpointed=uncp,
            signal_failed=signal_failed)
+    whys = {}
+    for i in uncp:
+        j = by_id[i]
+        if j.get("workflow") not in CHECKPOINT_HOLDS_DIR:
+            whys[i] = ("it runs %s, which has no checkpoint hold "
+                       "venue" % j.get("workflow"))
+        elif i in signal_failed:
+            whys[i] = "its hold signal could not be queued"
+        else:
+            whys[i] = ("it did not honor the checkpoint hold "
+                       "inside its window (%gs)" % windows[i])
+    return {"host": host, "tracked": tracked, "queued": queued,
+            "by_id": by_id, "windows": windows,
+            "checkpointed": checkpointed, "finished": finished,
+            "ended": ended, "uncheckpointed": uncp,
+            "signal_failed": signal_failed, "whys": whys,
+            "clean": clean, "started": started}
+
+
+def cmd_drain(args):
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    d = _drain_host(host, args.requested_by, window=args.window)
+    tracked = d["tracked"]
+    queued = d["queued"]
+    by_id = d["by_id"]
+    checkpointed = d["checkpointed"]
+    finished = d["finished"]
+    ended = d["ended"]
+    uncp = d["uncheckpointed"]
+    clean = d["clean"]
     print("DRAIN host=%s — tracked %d running job(s), %d queued "
           "job(s) waiting under the drain hold"
           % (host, len(tracked), len(queued)))
@@ -5394,15 +5432,7 @@ def cmd_drain(args):
               % (i, by_id[i].get("key")))
     for i in uncp:
         j = by_id[i]
-        if j.get("workflow") not in CHECKPOINT_HOLDS_DIR:
-            why = ("it runs %s, which has no checkpoint hold "
-                   "venue" % j.get("workflow"))
-        elif i in signal_failed:
-            why = "its hold signal could not be queued"
-        else:
-            why = ("it did not honor the checkpoint hold "
-                   "inside its window (%gs)"
-                   % windows[i])
+        why = d["whys"][i]
         print("  UNCHECKPOINTED %s key=%s — %s; if the host "
               "goes down now this job is interrupted and its "
               "in-flight work is lost (resubmission is the "
