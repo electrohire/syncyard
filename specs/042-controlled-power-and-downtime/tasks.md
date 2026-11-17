@@ -26,8 +26,14 @@ rails of FR-017/FR-018.
       attempt); laptop-bench and air-inference stay
       wake-free by design. Recorded in spec.md's decision
       log.
-- [ ] D3 First rollout wave: tower-compute, tower-offsite,
-      sbc-inference; mini-server second (recommendation).
+- [x] D3 First rollout wave: **RULED by the owner
+      2026-11-17: the first wave INCLUDES mini-server**
+      alongside tower-compute, tower-offsite, and
+      sbc-inference (the owner overruled the recommendation
+      to hold mini-server to a second wave). Recorded in
+      spec.md's decision log. (T020's premise changes with
+      this ruling: mini-server is a wave-1 host, not a
+      second-wave join.)
 - [ ] D4 Downtime push set: four chats × open/escalate/close
       (recommendation), or main chat escalations-only.
 - [ ] D5 Defaults ratification: return window 900 s,

@@ -748,6 +748,11 @@ proves.
    have the widest blast radius and deserve the verbs proven
    elsewhere first. Roaming and off-fleet hosts stay out per
    FR-016 regardless of wave.
+   **DECISION LOG — RULED 2026-11-17 (owner, Syncyard
+   chat): the first rollout wave INCLUDES mini-server**
+   alongside tower-compute, tower-offsite, and
+   sbc-inference. The owner overruled the recommendation
+   to hold mini-server to a second wave.
 4. **Downtime push set.** FR-013 pushes open / escalate /
    close to four chats (Syncyard, umbrella, the machine's
    own chat, main). **Recommendation: keep all four for all
