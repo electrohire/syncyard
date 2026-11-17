@@ -93,6 +93,10 @@ hosts:
     cwd:
       linux.yml: /var/lib/runner
       grab.yml: null
+    wol:
+      mac: "00:11:22:33:44:55"
+      via: roam
+      enabled: true
   roam:
     type: linux
     roaming: true
@@ -100,6 +104,10 @@ hosts:
       linux.yml: execute
       grab.yml: grab
     identity: [LID_HOST, LID_USER, LID_OS]
+    wol:
+      mac: "00:11:22:33:44:66"
+      via: tower
+      enabled: true
   airmac:
     type: macos
     roaming: true
@@ -863,6 +871,297 @@ check("FR-008 rendering: a planned-down host renders "
       and res["snap_state"] == "DOWN-BY-ACTION"
       and res["snap_action"] == "poweroff"
       and res["roam_absent"], str(res))
+
+# =========================================================================
+# Slice 2 — Wake-on-LAN (FR-010) and the recovery ladder (FR-014/015)
+# =========================================================================
+
+# --- WoL: config validation + standing + the roaming refusal ------------------
+res = run_driver(r"""
+import importlib.util, copy
+cspec = importlib.util.spec_from_file_location(
+    "cfg2", os.path.join(BASE_DIR, "config.py"))
+cfg = importlib.util.module_from_spec(cspec)
+cspec.loader.exec_module(cfg)
+def bad(mutate):
+    c = copy.deepcopy(cfg.load_config(
+        os.environ["SYNCYARD_CONFIG"]))
+    mutate(c)
+    try:
+        cfg.validate(c)
+        return False
+    except cfg.ConfigError:
+        return True
+o1, d1 = gk.wol_attempt("roam")
+o2, d2 = gk.wol_attempt("win")
+rc3, out3 = call(gk.cmd_wol, NS(host="tower"))
+senders = [j for j in gk.load_jobs()
+           if str(j.get("key") or "").startswith("gk-wol-")]
+script = script_of(senders[0]) if senders else ""
+w = (hosts_state().get("tower") or {}).get("wol") or {}
+print(json.dumps({
+    "bad_mac": bad(lambda c: c["hosts"]["tower"]["wol"]
+                   .update(mac="00:11:22:33:44")),
+    "bad_via": bad(lambda c: c["hosts"]["tower"]["wol"]
+                   .update(via="nowhere")),
+    "bad_enabled": bad(lambda c: c["hosts"]["tower"]["wol"]
+                       .update(enabled="yes")),
+    "roam": o1, "win": o2, "rc3": rc3,
+    "senders": len(senders), "script": script,
+    "attempts": len(w.get("attempts") or []),
+    "sender": (w.get("attempts") or [{}])[0].get("sender"),
+    "standing": gk.wol_standing("tower"),
+}))
+""")
+check("WoL config: a malformed MAC, an unknown via host, "
+      "and a non-bool enabled all fail closed",
+      res["bad_mac"] and res["bad_via"] and res["bad_enabled"],
+      str(res))
+check("WoL: a roaming host is wake-free even with a block "
+      "written for it (ruling D2), an unconfigured host "
+      "reports NOT-CONFIGURED, and a configured attempt "
+      "queues the sender job on the via host with the MAC "
+      "in it — standing CONFIGURED, attempt logged with "
+      "its sender",
+      res["roam"] == "WOL-NOT-CONFIGURED"
+      and res["win"] == "WOL-NOT-CONFIGURED"
+      and res["rc3"] == 0 and res["senders"] == 1
+      and "00:11:22:33:44:55" in res["script"]
+      and res["attempts"] == 1 and res["sender"] == "roam"
+      and res["standing"] == "CONFIGURED", str(res))
+
+LADDER_PRELUDE = r"""
+PROBE = {"heartbeat_age_s": None, "runners_online": 0,
+         "agent": None, "lan_reachable": None}
+gk._ladder_probe = lambda host: dict(PROBE)
+def ladder_steps(host="tower"):
+    rec = gk.downtime_open_record(host)
+    if rec is None:
+        store = gk.load_downtime()
+        rec = [c for c in store["closed"]
+               if c["host"] == host][-1]
+    return [(e["step"], e["outcome"]) for e in rec["ladder"]]
+"""
+
+# --- Ladder: the host answers at step 1 ---------------------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("tower", "operator", jobs=[])
+st = gk.load_hosts_state()
+r = gk._host_record(st, "tower")
+r["last_heartbeat_ts"] = "2026-11-17T12:00:30Z"
+gk.save_hosts_state(st)
+gk.ladder_pass([])
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "tower"]
+print(json.dumps({
+    "closed": [c["closing"] for c in mine],
+    "account": mine[0]["closing_account"] if mine else "",
+    "steps": ladder_steps(),
+}))
+""")
+check("ladder: a host that answers the step-1 re-probe on "
+      "its own identity closes RECOVERED-UNASSISTED — the "
+      "ladder took no active step and claims none",
+      res["closed"] == ["RECOVERED-UNASSISTED"]
+      and "heartbeat" in res["account"] and res["steps"] == [],
+      str(res))
+
+# --- Ladder: wakes at step 2, wake PROVEN by the return -------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("tower", "operator", jobs=[])
+gk.ladder_pass([])
+mid = gk.downtime_open_record("tower")
+senders = [j for j in gk.load_jobs()
+           if str(j.get("key") or "").startswith("gk-wol-")]
+PROBE["runners_online"] = 1
+gk.ladder_pass([])
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "tower"]
+w = (hosts_state().get("tower") or {}).get("wol") or {}
+print(json.dumps({
+    "mid_state": mid["state"], "senders": len(senders),
+    "closed": [c["closing"] for c in mine],
+    "account": mine[0]["closing_account"] if mine else "",
+    "steps": ladder_steps(),
+    "wol_state": w.get("state"),
+}))
+""")
+check("ladder: step 1 re-probes, step 2 sends the wake "
+      "(sender job queued), and the host's return closes "
+      "RECOVERED-BY-LADDER at step 2 — and the wake "
+      "standing becomes PROVEN, by the return, not the "
+      "send",
+      res["mid_state"] == "LADDER" and res["senders"] == 1
+      and res["closed"] == ["RECOVERED-BY-LADDER"]
+      and "step 2 (wake)" in res["account"]
+      and res["steps"] == [[1, "re-probed"], [2, "WOL-SENT"]]
+      and res["wol_state"] == "PROVEN", str(res))
+
+# --- Ladder: returns during backoff ----------------------------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("win", "operator", jobs=[])
+gk.ladder_pass([])
+advance(120)
+gk.ladder_pass([])
+PROBE["runners_online"] = 1
+gk.ladder_pass([])
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "win"]
+print(json.dumps({
+    "closed": [c["closing"] for c in mine],
+    "steps": ladder_steps("win"),
+}))
+""")
+check("ladder: a host with no wake step logs "
+      "WOL-NOT-CONFIGURED at step 2, and a return during "
+      "the backoff closes RECOVERED-UNASSISTED",
+      res["closed"] == ["RECOVERED-UNASSISTED"]
+      and res["steps"] == [[1, "re-probed"],
+                           [2, "WOL-NOT-CONFIGURED"],
+                           [3, "re-probed"]], str(res))
+
+# --- Ladder: stack restart at step 4 ----------------------------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+PROBE["lan_reachable"] = True
+def restart(host):
+    PROBE["runners_online"] = 1
+    return True, "stub restart ok"
+gk._ladder_stack_restart = restart
+gk.open_downtime("win", "operator", jobs=[])
+gk.ladder_pass([])
+advance(120); gk.ladder_pass([])
+advance(180); gk.ladder_pass([])
+advance(300); gk.ladder_pass([])
+gk.ladder_pass([])
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "win"]
+print(json.dumps({
+    "closed": [c["closing"] for c in mine],
+    "account": mine[0]["closing_account"] if mine else "",
+    "steps": ladder_steps("win"),
+}))
+""")
+check("ladder: with a LAN channel proving the host alive "
+      "but its stack down, step 4 restarts the stack and "
+      "the return closes RECOVERED-BY-LADDER at step 4 — "
+      "after the full backoff, in order",
+      res["closed"] == ["RECOVERED-BY-LADDER"]
+      and "step 4 (stack restart)" in res["account"]
+      and [s for s, _ in res["steps"]] == [1, 2, 3, 3, 3, 4]
+      and res["steps"][-1][1] == "restarted", str(res))
+
+# --- Ladder: one controlled reboot at step 5 ---------------------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("win", "operator", jobs=[])
+gk.ladder_pass([])
+advance(120); gk.ladder_pass([])
+advance(180); gk.ladder_pass([])
+advance(300); gk.ladder_pass([])
+gk.ladder_pass([])
+gk.ladder_pass([])
+acts = gk.load_power_actions()
+mid = gk.downtime_open_record("win")
+BACK[0] = False
+advance(61); gk.power_pass()
+BACK[0] = True
+gk.power_pass()
+PROBE["runners_online"] = 1
+gk.ladder_pass([])
+gk.ladder_pass([])
+acts2 = gk.load_power_actions()
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "win"]
+print(json.dumps({
+    "n_actions": len(acts), "by": acts[0]["requested_by"]
+    if acts else None,
+    "mid_stage": (mid.get("ladder_state") or {}).get("stage"),
+    "verdict": acts2[0]["verdict"] if acts2 else None,
+    "n_actions_after": len(acts2),
+    "closed": [c["closing"] for c in mine],
+    "account": mine[0]["closing_account"] if mine else "",
+    "steps": ladder_steps("win"),
+}))
+""")
+check("ladder: with no channel alive, step 5 spends ONE "
+      "controlled reboot (requested by the ladder, drain "
+      "accounting in its record); the verified return "
+      "closes RECOVERED-BY-LADDER at step 5, and no second "
+      "reboot is ever spent",
+      res["n_actions"] == 1 and res["by"] == "downtime-ladder"
+      and res["mid_stage"] == "await-return"
+      and res["verdict"] == "VERIFIED"
+      and res["n_actions_after"] == 1
+      and res["closed"] == ["RECOVERED-BY-LADDER"]
+      and "step 5 (controlled reboot)" in res["account"]
+      and res["steps"][-1] == [5, "signaled"], str(res))
+
+# --- Ladder: never returns — budget flip, FAILED wake, slow re-probe ----------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("tower", "operator", jobs=[])
+gk.ladder_pass([])
+advance(120); gk.ladder_pass([])
+advance(180); gk.ladder_pass([])
+advance(300); gk.ladder_pass([])
+gk.ladder_pass([])
+gk.ladder_pass([])
+BACK[0] = False
+advance(61); gk.power_pass()
+advance(900); gk.power_pass()
+gk.ladder_pass([])
+advance(300)
+gk.ladder_pass([])
+rec = gk.downtime_open_record("tower")
+w = (hosts_state().get("tower") or {}).get("wol") or {}
+print(json.dumps({
+    "state": rec["state"],
+    "steps": [(e["step"], e["outcome"]) for e in rec["ladder"]],
+    "detectors": rec["detectors"],
+    "wol_state": w.get("state"),
+    "notify": len(events("downtime_notify")),
+    "owner": rec["physical_owner"],
+}))
+""")
+check("ladder: a host that never returns walks every step "
+      "in order, the missed reboot appends its detector to "
+      "the same record, and at budget expiry the record "
+      "flips NEEDS-PHYSICAL — wake marked FAILED (attempted, "
+      "never proven), exactly one escalation push",
+      res["state"] == "NEEDS-PHYSICAL"
+      and [s for s, _ in res["steps"]]
+          == [1, 2, 3, 3, 3, 4, 5, 5, "flip"]
+      and res["wol_state"] == "FAILED"
+      and res["notify"] == 1
+      and any(d.startswith("power-action:")
+              for d in res["detectors"])
+      and res["owner"] == "Tristen Pierson", str(res))
+
+# --- After the flip: slow re-probe only ----------------------------------------------
+res = run_driver(LADDER_PRELUDE + r"""
+gk.open_downtime("tower", "operator", jobs=[])
+gk.escalate_downtime("tower")
+st = gk.load_hosts_state()
+r = gk._host_record(st, "tower")
+r["last_heartbeat_ts"] = "2026-11-17T12:00:30Z"
+gk.save_hosts_state(st)
+gk.ladder_pass([])
+early = gk.downtime_open_record("tower")
+advance(3601)
+gk.ladder_pass([])
+store = gk.load_downtime()
+mine = [c for c in store["closed"] if c["host"] == "tower"]
+print(json.dumps({
+    "early_open": early is not None,
+    "closed": [c["closing"] for c in mine],
+    "account": mine[0]["closing_account"] if mine else "",
+}))
+""")
+check("ladder: after NEEDS-PHYSICAL the only automated "
+      "act is the slow re-probe — a return inside the "
+      "interval is not acted on early, and the re-probe "
+      "closes the record RECOVERED-UNASSISTED when it "
+      "notices the return",
+      res["early_open"] and res["closed"] == ["RECOVERED-UNASSISTED"]
+      and "slow re-probe" in res["account"], str(res))
 
 print()
 if fails:
