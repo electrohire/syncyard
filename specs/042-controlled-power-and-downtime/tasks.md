@@ -171,15 +171,16 @@ rails of FR-017/FR-018.
       (agent, each runner lane) from the stack's own answers
       afterward. Surface only — spec 040 owns the internals
       it triggers; reconcile naming at spec 040's landing.
-- [ ] T013 WoL: `wol` config block (mac, via, enabled),
+- [x] T013 WoL: `wol` config block (mac, via, enabled),
       fail-closed validation; the send executed by the `via`
       host, logged with sender/target/time; host record
       distinguishes CONFIGURED from PROVEN (first observed
       wake) and records a failed first attempt as FAILED,
       never silently retried as if unconfigured.
 
+      DONE 2026-11-17 (slice 2): the wol block is validated fail-closed (MAC shape, via = another declared host, enabled bool); the send is executed by the via host as a maintenance job (Linux sender build) and logged with sender/target/time on the ledger and the host record; the record distinguishes CONFIGURED / PROVEN (first observed wake, marked at the return) / FAILED (first attempt, no return inside the incident). No live wake attempted — proving is Phase 6.
 ## Phase 5 — The recovery ladder + physical escalation (FR-014–FR-016)
-- [ ] T014 Ladder engine: steps 1–5 in order, each bounded
+- [x] T014 Ladder engine: steps 1–5 in order, each bounded
       and logged to the record (multi-channel re-probe; wake
       where configured; +2/+5/+10 backoff re-probes; lesser
       stack restart over a proven-live channel; ONE
@@ -188,25 +189,21 @@ rails of FR-017/FR-018.
       closing states RECOVERED-BY-LADDER (step named) /
       RECOVERED-UNASSISTED / still-down. Recovery claimed
       only on the host's own identity (FR-005 standard).
-- [ ] T015 NEEDS-PHYSICAL flip: named owner per host
+      DONE as machinery 2026-11-17 (slice 2): the engine runs on the sweep cadence, one stage per pass, and the battery pins every acceptance outcome — answers at step 1, wakes at step 2, returns during backoff, stack-restarts at step 4, reboots at step 5 (one maximum), never-returns to budget-expiry NEEDS-PHYSICAL. Step 4's on-host restart internals are spec 040's: the ladder's seam reports unavailable until that surface lands — logged in the record, never faked — and the ladder moves to step 5. Field proof is Phase 6.
+- [x] T015 NEEDS-PHYSICAL flip: named owner per host
       (Tristen; Ryan Anderson for a hand-filed
       layer1labs-inference record), per-class on-site
       checklist (incl. laptop-bench's dock note, for the
       hand-filed case), ladder log attached as already-tried;
       slow re-probe only afterward, with close-on-return.
+      DONE 2026-11-17 (slice 2): the flip writes the named owner, the per-class on-site checklist (incl. the network cable and dock line), and the ladder log as the already-tried account; afterward only the slow re-probe runs, closing on return — all pinned by fixtures.
 - [x] T016 Exceptions enforced in code, not config habit:
       `roaming: true` hosts (air-inference, laptop-bench)
       produce zero records/pushes/ladder steps at any silence
       length (72 h fixture); layer1labs-inference: no ladder,
       no power verbs, hand-filed records only with the
       limited re-probe ladder.
-      PARTIAL 2026-11-17 (slice 1): the record/push half is
-      enforced in code and battery-pinned (roaming hosts
-      open zero records under any detector; the
-      layer1labs-inference shape = off_fleet: hand-filed
-      only, no power verbs). The ladder half lands with
-      T014 (slice 2); the 72 h fixture is Phase 6 drill
-      work.
+      STATUS 2026-11-17: enforced in code and battery-pinned on both halves — roaming hosts open zero records under any detector (so no pushes and no ladder can ever run for them), and the layer1labs-inference shape (off_fleet) is hand-filed only, takes no power verbs, and its ladder is re-probe only. What remains open is the 72 h silence fixture, which is Phase 6 drill work (T019).
 
 ## Phase 6 — Field legs (gate for FR-019's broadcast)
 - [ ] T017 tower-offsite leg (declared window): reboot +
