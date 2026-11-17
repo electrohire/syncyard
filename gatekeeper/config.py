@@ -96,6 +96,26 @@ DEFAULTS = {
     # --delay overrides it, so in-flight uploads and log
     # writes finish before the host goes down.
     "reboot": {"grace_s": 60},
+    # Controlled power (spec 042): `gk power`
+    # generalizes the reboot verb to reboot / poweroff /
+    # cancel over every host OS. return_window_s is the
+    # expected-return window a reboot opens at signal: the
+    # host must prove itself back (fresh heartbeat / runner
+    # evidence) inside it or the action closes RETURN-MISSED.
+    # confirm_down_s is the silence a poweroff must be
+    # observed for, heartbeat and runners quiet for the full
+    # window, before it closes CONFIRMED-DOWN.
+    "power": {"return_window_s": 900, "confirm_down_s": 180},
+    # Fleet downtime records (spec 042): the
+    # standing notify registrations every downtime state
+    # transition (open / NEEDS-PHYSICAL / close) pushes to,
+    # exactly once per target. notify_chats names the
+    # fleet-wide targets (the Syncyard chat, the Fleet
+    # umbrella chat, the main chat); host_chats maps a host
+    # to its own machine chat. Empty means unregistered: the
+    # record still opens and ledgers, it just pushes nowhere
+    # until the registrations land.
+    "downtime": {"notify_chats": [], "host_chats": {}},
     # Checkpoint hold: the cooperative
     # job-level pause contract. A dispatch passes each script
     # job the venue path of its per-job hold file (holds_dir
@@ -456,6 +476,25 @@ def validate(cfg):
             or grace <= 0):
         raise ConfigError(
             "reboot.grace_s must be a positive number of seconds")
+    pw = cfg.get("power") or {}
+    for pkey in ("return_window_s", "confirm_down_s"):
+        pval = pw.get(pkey)
+        if (isinstance(pval, bool)
+                or not isinstance(pval, (int, float)) or pval <= 0):
+            raise ConfigError(
+                f"power.{pkey} must be a positive number of seconds")
+    dt = cfg.get("downtime") or {}
+    notify = dt.get("notify_chats")
+    if (not isinstance(notify, list)
+            or not all(isinstance(c, str) and c for c in notify)):
+        raise ConfigError(
+            "downtime.notify_chats must be a list of chat ids")
+    host_chats = dt.get("host_chats")
+    if (not isinstance(host_chats, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) and v
+                       for k, v in host_chats.items())):
+        raise ConfigError(
+            "downtime.host_chats must map host names to chat ids")
     ck = cfg.get("checkpoint") or {}
     code = ck.get("exit_code")
     if (isinstance(code, bool) or not isinstance(code, int)
@@ -543,6 +582,20 @@ def validate(cfg):
         image = host.get("image")
         if image is not None and not (isinstance(image, str) and image):
             raise ConfigError(f"hosts.{name}: image must be a non-empty string")
+        # Spec 042 host flags: `roaming` hosts
+        # (shared / roaming machines) never open downtime
+        # records, never run ladders, never push; `off_fleet`
+        # hosts (not gatekeeper venues, not on the tailnet)
+        # take no power verbs and hand-filed downtime records
+        # only. `physical_owner` names who a NEEDS-PHYSICAL
+        # escalation goes to for this host.
+        for flag in ("roaming", "off_fleet"):
+            if flag in host and not isinstance(host[flag], bool):
+                raise ConfigError(f"hosts.{name}: {flag} must be a boolean")
+        owner = host.get("physical_owner")
+        if owner is not None and not (isinstance(owner, str) and owner):
+            raise ConfigError(
+                f"hosts.{name}: physical_owner must be a non-empty string")
         if host.get("type") == "wsl2":
             via_wf = (hosts.get(host.get("via")) or {}).get("workflows") or {}
             for wname, kind in wf.items():
@@ -553,6 +606,11 @@ def validate(cfg):
     for wname in declared:
         if wname not in served:
             raise ConfigError(f"workflows: {wname!r} is served by no host")
+    for hname in ((cfg.get("downtime") or {}).get("host_chats") or {}):
+        if hname not in hosts:
+            raise ConfigError(
+                f"downtime.host_chats: host {hname!r} is not a "
+                f"declared host")
     # lanes live in named profiles.
     # Validation is fail-closed over the whole table — every
     # profile, active or not — and the pre-016 flat shape

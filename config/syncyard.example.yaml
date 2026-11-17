@@ -72,6 +72,33 @@ liveness:
 reboot:
   grace_s: 60
 
+# Controlled power (spec 042). `gk power --host <host>
+# --action reboot|poweroff|cancel` generalizes the reboot
+# verb. return_window_s is the expected-return window a
+# reboot opens at signal: the host must prove itself back
+# inside it or the action closes RETURN-MISSED and opens a
+# downtime record. confirm_down_s is the silence a poweroff
+# must be observed for (heartbeat and runners quiet for the
+# full window) before it closes CONFIRMED-DOWN. Failure
+# mode: a non-positive or non-numeric value fails closed
+# at load.
+power:
+  return_window_s: 900
+  confirm_down_s: 180
+
+# Fleet downtime records (spec 042). Every downtime
+# state transition (open / NEEDS-PHYSICAL / close) pushes
+# exactly once to each registered target: notify_chats
+# names the fleet-wide targets (the Syncyard chat, the
+# Fleet umbrella chat, the main chat) and host_chats maps
+# a host to its own machine chat. Empty lists mean the
+# records still open and ledger, they just push nowhere
+# until the registrations land. A host_chats key naming an
+# undeclared host fails closed at load.
+downtime:
+  notify_chats: []
+  host_chats: {}
+
 # Checkpoint hold. The cooperative job-level
 # pause contract: at dispatch each script job is passed the
 # venue path of its own hold file (holds_dir for its workflow
@@ -143,7 +170,17 @@ lock:
 # fleet's Windows host; `desktop-wsl` is its WSL2 distro,
 # reached through it (its workflows ride the via host's
 # runner). A job addressed to a lane runs on that lane's host
-# or is refused — never silently rerouted.
+# or is refused — never silently rerouted. Two optional
+# spec 042 flags ride a host entry: `roaming: true` (a
+# shared / roaming machine — it never opens a downtime
+# record, never runs a recovery ladder, never pushes, at
+# any silence length) and `off_fleet: true` (not a
+# gatekeeper venue and not on the tailnet — no power verbs;
+# downtime records for it are hand-filed only). A third,
+# `physical_owner: <name>`, names who a NEEDS-PHYSICAL
+# escalation for the host goes to (default: the fleet
+# owner). Removing a host from an exception set is a config
+# change with the owner's name on it, never a default.
 hosts:
   desktop:
     type: windows
