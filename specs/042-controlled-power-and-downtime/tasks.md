@@ -210,6 +210,67 @@ rails of FR-017/FR-018.
       VERIFIED return; poweroff + CONFIRMED-DOWN; scheduled
       action + cancel confirmed. Action records are the
       evidence.
+      STATUS 2026-11-17: first attempt RUN and FAILED
+      honestly — see T017-A. The reboot leg's action record
+      (20261117T133914Z-power-reboot-tower-offsite-384c35)
+      closed UNVERIFIED ("host never went down inside the
+      return window — the reboot did not take"); the host
+      never rebooted. The leg re-runs after T017-A's fix
+      AND the per-host sudoers prerequisite below are both
+      in place.
+- [x] T017-A Signal-layer fix (AMENDMENT, 2026-11-17,
+      field leg A finding). Defect, proven from the failed
+      leg's own signal run log (run 44094947193): the Linux
+      maintenance signal body ran `shutdown -r +1` as the
+      unprivileged runner account; logind refused it
+      ("Failed to set wall message, ignoring: Interactive
+      authentication required." / "Failed to schedule
+      shutdown: Interactive authentication required."), no
+      shutdown was ever scheduled, and the body's
+      unconditional `exit 0` made the job conclude success
+      anyway — while the action record marked signal.ok on
+      mere queueing. The closing-verdict machinery worked
+      exactly as designed (UNVERIFIED, no downtime record);
+      the signal layer is what lied. Fix (this amendment's
+      change): (1) the Linux signal and abort bodies invoke
+      ONLY through `sudo -n` — delayed actions via
+      /usr/sbin/shutdown, immediate via /usr/bin/systemctl,
+      cancel via shutdown -c — under the scoped drop-in
+      shipped at gatekeeper/power-actions/
+      sudoers-syncyard-power (the runner account may run
+      exactly those commands, nothing else); a missing
+      drop-in or a refused sudo is a loud FAIL, never a
+      fallback to the unprivileged call; (2) every Linux
+      body prints POWER_SIGNAL_VERDICT / POWER_SIGNAL_DETAIL
+      markers and exits non-zero on any failure — the
+      delayed body verifies the scheduled state at
+      /run/systemd/shutdown/scheduled (MODE line) before
+      claiming OK, the abort body verifies no scheduled
+      state still stands, and no body carries an
+      unconditional exit 0; (3) the record's signal.ok is
+      set ONLY from the signal job's harvested payload
+      verdict at the sweep settle (OK confirms; FAIL closes
+      UNVERIFIED at once with the payload's detail; a
+      success conclusion with no marker closes UNVERIFIED
+      as MISSING) — queueing sets it to None (pending),
+      never true. Battery: test_spec042.py gains 12
+      amendment checks (49 total, ALL PASS), including the
+      bodies executed against stub sudoes (refusal,
+      acceptance, accepted-but-unscheduled, no-sudo, abort
+      shapes). ROLLOUT PREREQUISITE (new, binds T017,
+      T018, T020 and every later Linux live fire): before
+      a wave-1 Linux host's first live power action, the
+      drop-in must be installed on it as
+      /etc/sudoers.d/syncyard-power (runner account
+      substituted — 'runner' on the tower-compute and
+      tower-offsite lanes, verified per host — mode 0440,
+      `visudo -cf` clean) and proven non-destructively AS
+      the runner account: `sudo -n -l /usr/sbin/shutdown`
+      lists the command with no prompt. Hosts in wave 1:
+      tower-compute, tower-offsite, sbc-inference,
+      mini-server. Installing the drop-in is a separate,
+      later step — this amendment ships the artifact and
+      the code only.
 - [ ] T018 sbc-inference leg: reboot + VERIFIED return.
 - [ ] T019 Drills: jammed-stack fixture recovered by the
       ladder's lesser step; killed-host fixture walked to

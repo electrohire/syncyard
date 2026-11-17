@@ -6079,13 +6079,147 @@ def _power_last_action(rec, verdict=None):
             "verdict": verdict}
 
 
+POWER_SCHEDULED_FILE = "/run/systemd/shutdown/scheduled"
+
+
+def _power_marker(text, name):
+    """The value a marker line carries, or None when the
+    marker is absent: 'POWER_SIGNAL_VERDICT OK' -> 'OK',
+    'POWER_SIGNAL_DETAIL x y' -> 'x y'. Works on a job's
+    harvested marker list joined back into text, or on a
+    backchannel command's raw output."""
+    if isinstance(text, (list, tuple)):
+        text = "\n".join(str(x) for x in text)
+    for ln in str(text or "").splitlines():
+        ln = ln.strip()
+        if ln == name:
+            return ""
+        if ln.startswith(name + " "):
+            return ln[len(name) + 1:].strip()
+    return None
+
+
+def _linux_power_prelude():
+    """The preamble every Linux power body starts with
+    (spec 042 amendment, 2026-11-17): resolve the
+    scheduled-shutdown file (a test seam may redirect it
+    via POWER_SIGNAL_SCHEDULED_FILE) and refuse to run at
+    all when sudo is absent — there is no unprivileged
+    fallback, by design."""
+    return (
+        'SD=${POWER_SIGNAL_SCHEDULED_FILE:-%s}; '
+        'if ! command -v sudo >/dev/null 2>&1; then '
+        'echo "POWER_SIGNAL_VERDICT FAIL"; '
+        'echo "POWER_SIGNAL_DETAIL sudo is not installed '
+        'on this host — the privileged power route is '
+        'unavailable and no unprivileged fallback is '
+        'permitted (see gatekeeper/power-actions/'
+        'sudoers-syncyard-power)"; exit 1; fi; '
+        % POWER_SCHEDULED_FILE)
+
+
+def _linux_signal_body(action, delay_s):
+    """The Linux power signal body: ONE shell program whose
+    exit code is its payload verdict (spec 042 amendment,
+    2026-11-17, from field leg A).
+
+    Field leg A's body ran `shutdown` as the unprivileged
+    runner account; logind refused it ("Interactive
+    authentication required"), nothing was scheduled, and
+    the body's unconditional `exit 0` reported success
+    anyway. The amended body therefore:
+      - invokes ONLY through `sudo -n` — the scoped
+        drop-in at gatekeeper/power-actions/
+        sudoers-syncyard-power grants the runner account
+        exactly these commands; a missing drop-in is a
+        loud FAIL, never a silent fallback to the
+        unprivileged call;
+      - for a delayed action, verifies the shutdown was
+        actually scheduled before claiming OK: systemd
+        records a scheduled shutdown at
+        /run/systemd/shutdown/scheduled with a MODE line
+        naming the action;
+      - prints POWER_SIGNAL_VERDICT / POWER_SIGNAL_DETAIL
+        markers on every path and exits non-zero on every
+        failure. There is no unconditional exit 0.
+    An immediate (delay 0) action rides systemctl through
+    the same privileged route; it has no scheduled state
+    to inspect, so its OK claims only logind's acceptance
+    — the record's closing verdict still comes from the
+    host's observed state, as FR-005/FR-006 require."""
+    if delay_s and delay_s > 0:
+        mins = max(1, int(math.ceil(delay_s / 60.0)))
+        flag = "-r" if action == "reboot" else "-h"
+        mode = "reboot" if action == "reboot" else "poweroff"
+        invoke = '/usr/sbin/shutdown %s +%d "%s"' % (
+            flag, mins, POWER_SIGNAL_TEXT)
+        verify = (
+            'sleep 1; '
+            'if [ -f "$SD" ] && grep -q "^MODE=%s" "$SD"; '
+            'then echo "POWER_SIGNAL_VERDICT OK"; '
+            'echo "POWER_SIGNAL_DETAIL scheduled shutdown '
+            'verified at $SD: $(cat $SD | tr \'\\n\' \' \')"; '
+            'exit 0; fi; '
+            'echo "POWER_SIGNAL_VERDICT FAIL"; '
+            'echo "POWER_SIGNAL_DETAIL shutdown accepted '
+            '(rc=0) but no scheduled state with MODE=%s at '
+            '$SD — the signal did not take"; exit 1'
+            % (mode, mode))
+    else:
+        verb = "reboot" if action == "reboot" else "poweroff"
+        invoke = "/usr/bin/systemctl %s" % verb
+        verify = (
+            'echo "POWER_SIGNAL_VERDICT OK"; '
+            'echo "POWER_SIGNAL_DETAIL immediate %s accepted '
+            'via the privileged route (sudo -n %s, rc=0); '
+            'an immediate action has no scheduled state to '
+            'inspect — the closing verdict comes from '
+            'observed host state"; exit 0' % (verb, invoke))
+    label = invoke.replace('"', "")
+    return (
+        _linux_power_prelude()
+        + ('out=$(sudo -n %s 2>&1); rc=$?; '
+           'if [ $rc -ne 0 ]; then '
+           'echo "POWER_SIGNAL_VERDICT FAIL"; '
+           'echo "POWER_SIGNAL_DETAIL sudo -n %s refused '
+           '(rc=$rc): $out"; exit 1; fi; ' % (invoke, label))
+        + verify)
+
+
+def _linux_abort_body():
+    """The Linux abort body, through the same privileged
+    route as the signal (spec 042 amendment, 2026-11-17):
+    cancel with `sudo -n /usr/sbin/shutdown -c`, then prove
+    the cancellation — no scheduled state may still stand.
+    Same marker + exit discipline as the signal body. The
+    cancel VERDICT still settles from observed host state
+    (FR-006); this body only proves the abort itself."""
+    return (
+        _linux_power_prelude()
+        + ('out=$(sudo -n /usr/sbin/shutdown -c 2>&1); '
+           'rc=$?; '
+           'if [ $rc -ne 0 ]; then '
+           'echo "POWER_SIGNAL_VERDICT FAIL"; '
+           'echo "POWER_SIGNAL_DETAIL sudo -n '
+           '/usr/sbin/shutdown -c refused (rc=$rc): $out"; '
+           'exit 1; fi; '
+           'if [ -f "$SD" ]; then '
+           'echo "POWER_SIGNAL_VERDICT FAIL"; '
+           'echo "POWER_SIGNAL_DETAIL abort accepted '
+           '(rc=0) but a scheduled shutdown still stands '
+           'at $SD — the cancel did not take"; exit 1; fi; '
+           'echo "POWER_SIGNAL_VERDICT OK"; '
+           'echo "POWER_SIGNAL_DETAIL abort verified: no '
+           'scheduled shutdown stands at $SD"; exit 0'))
+
+
 def _power_body(host, action, delay_s):
     """The OS command body for a power signal, or None
     when the host's OS takes no initiated power action
     (macOS, FR-001). Windows/WSL2 ride shutdown.exe exactly
-    as `gk reboot` sends it; Linux rides shutdown(8) with a
-    minute delay when a grace was asked (which is what
-    makes it cancellable), systemctl when immediate."""
+    as `gk reboot` sends it; Linux rides the privileged,
+    self-verifying body from _linux_signal_body (spec 042
+    amendment, 2026-11-17)."""
     os_ = HOST_TYPE.get(host)
     if os_ in ("windows", "wsl2"):
         verb = "/r" if action == "reboot" else "/s"
@@ -6093,13 +6227,7 @@ def _power_body(host, action, delay_s):
                 "/c \"%s\"" % (verb, int(delay_s),
                                POWER_SIGNAL_TEXT))
     if os_ == "linux":
-        if delay_s and delay_s > 0:
-            mins = max(1, int(math.ceil(delay_s / 60.0)))
-            return "shutdown %s +%d \"%s\"" % (
-                "-r" if action == "reboot" else "-h", mins,
-                POWER_SIGNAL_TEXT)
-        return "systemctl %s" % (
-            "reboot" if action == "reboot" else "poweroff")
+        return _linux_signal_body(action, delay_s)
     return None
 
 
@@ -6110,37 +6238,57 @@ def _power_abort_body(host):
     if os_ in ("windows", "wsl2"):
         return "/mnt/c/Windows/System32/shutdown.exe /a"
     if os_ == "linux":
-        return "shutdown -c"
+        return _linux_abort_body()
     return None
 
 
 def _power_signal(host, rec, route):
     """Send the action's signal over a proven route.
-    Returns (ok, detail). The two transports are spec
-    011's, unchanged: a backchannel command, or a
+    Returns (ok, detail, job_key). The two transports are
+    spec 011's, unchanged: a backchannel command, or a
     maintenance job through the existing submit machinery
-    (hold-exempt under the gk-power- key prefix)."""
+    (hold-exempt under the gk-power- key prefix).
+
+    ok is True only when the signal's payload verdict is
+    already known good: the backchannel route runs the body
+    synchronously, and with the amended Linux body its exit
+    code IS the body's own verdict (a FAIL marker in the
+    output trumps even a clean exit). ok is False when the
+    send itself failed. ok is None when a maintenance job
+    was queued and the payload verdict is still owed —
+    queueing is transport, not a verdict (spec 020; spec
+    042 amendment, 2026-11-17: field leg A's record called
+    a merely-queued job signal-ok while the host had
+    refused the signal). power_pass folds the harvested
+    verdict in via _power_signal_settle."""
     body = _power_body(host, rec["action"], rec["delay_s"])
     if body is None:
-        return False, "no initiated power action for this host OS"
+        return False, "no initiated power action for this host OS", None
     if route == "backchannel":
         bc = _bc_client_path()
         if bc is None:
-            return False, "backchannel client (bc.py) not found"
+            return False, "backchannel client (bc.py) not found", None
         rc, out, err = run_cmd([sys.executable, bc, "send",
                                 "--cmd", body], timeout=120)
+        verdict = _power_marker(out, "POWER_SIGNAL_VERDICT")
+        detail = _power_marker(out, "POWER_SIGNAL_DETAIL")
+        if verdict == "FAIL":
+            return False, "signal payload verdict FAIL: %s" % (
+                detail or (err or out or "").strip()[:200]), None
         if rc != 0:
             return False, "bc send rc=%d: %s" % (
-                rc, (err or out or "").strip()[:200])
-        return True, "backchannel send ok"
+                rc, (err or out or "").strip()[:200]), None
+        return True, detail or "backchannel send ok", None
     lanes = _host_lanes(host)
     if not lanes:
-        return False, "no lane is configured for this host"
+        return False, "no lane is configured for this host", None
     os_ = HOST_TYPE.get(host)
     if os_ == "linux":
         workflow = "linux.yml"
         script_name = "power-signal-%s.sh" % host
-        script = "#!/bin/sh\n%s\nexit 0\n" % body
+        # No trailing exit 0: the body's own exit code is
+        # the payload verdict (amendment, 2026-11-17).
+        script = "#!/bin/sh\n%s\n" % body
     else:
         workflow = "run.yml"
         script_name = "power-signal-%s.ps1" % host
@@ -6150,45 +6298,58 @@ def _power_signal(host, rec, route):
     try:
         _write_text_file(script_path, script)
     except (IOError, OSError) as exc:
-        return False, "could not write the signal script (%s)" % exc
+        return False, "could not write the signal script (%s)" % exc, None
+    key = "%s%s-%s-%s" % (POWER_KEY_PREFIX, host, rec["action"],
+                          now_dt().strftime("%Y%m%dT%H%M%SZ"))
     sub_args = types.SimpleNamespace(
-        key="%s%s-%s-%s" % (POWER_KEY_PREFIX, host, rec["action"],
-                            now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        key=key,
         program="syncyard", workflow=workflow, lane=lanes[0],
         script=script_path, grab_path=None, cwd=None, image=None,
         mounts=None, expected_min=1.0, maintenance=True,
         notify_chat=None)
     rc = cmd_submit(sub_args)
     if rc != 0:
-        return False, "signal job not accepted (submit rc=%d)" % rc
-    return True, "signal job queued via %s" % workflow
+        return False, "signal job not accepted (submit rc=%d)" % rc, None
+    return None, ("signal job queued via %s — payload verdict "
+                  "pending harvest" % workflow), key
 
 
 def _power_abort_signal(host, rec):
     """Send the OS abort for an in-grace action over the
-    route the action itself signaled on. (ok, detail)."""
+    route the action itself signaled on. Returns
+    (ok, detail, job_key) with _power_signal's semantics:
+    True only on a payload verdict known good at send time
+    (the synchronous backchannel route), False on a failed
+    send, None when a maintenance job was queued and the
+    abort's payload verdict is still owed."""
     body = _power_abort_body(host)
     if body is None:
-        return False, "no abort body for this host OS"
+        return False, "no abort body for this host OS", None
     route = (rec.get("signal") or {}).get("route")
     if route == "backchannel":
         bc = _bc_client_path()
         if bc is None:
-            return False, "backchannel client (bc.py) not found"
+            return False, "backchannel client (bc.py) not found", None
         rc, out, err = run_cmd([sys.executable, bc, "send",
                                 "--cmd", body], timeout=120)
+        verdict = _power_marker(out, "POWER_SIGNAL_VERDICT")
+        detail = _power_marker(out, "POWER_SIGNAL_DETAIL")
+        if verdict == "FAIL":
+            return False, "abort payload verdict FAIL: %s" % (
+                detail or (err or out or "").strip()[:200]), None
         if rc != 0:
             return False, "bc send rc=%d: %s" % (
-                rc, (err or out or "").strip()[:200])
-        return True, "backchannel abort sent"
+                rc, (err or out or "").strip()[:200]), None
+        return True, detail or "backchannel abort sent", None
     lanes = _host_lanes(host)
     if not lanes:
-        return False, "no lane is configured for this host"
+        return False, "no lane is configured for this host", None
     os_ = HOST_TYPE.get(host)
     if os_ == "linux":
         workflow = "linux.yml"
         script_name = "power-abort-%s.sh" % host
-        script = "#!/bin/sh\n%s\nexit 0\n" % body
+        # No trailing exit 0, as in _power_signal.
+        script = "#!/bin/sh\n%s\n" % body
     else:
         workflow = "run.yml"
         script_name = "power-abort-%s.ps1" % host
@@ -6198,18 +6359,20 @@ def _power_abort_signal(host, rec):
     try:
         _write_text_file(script_path, script)
     except (IOError, OSError) as exc:
-        return False, "could not write the abort script (%s)" % exc
+        return False, "could not write the abort script (%s)" % exc, None
+    key = "%s%s-abort-%s" % (POWER_KEY_PREFIX, host,
+                             now_dt().strftime("%Y%m%dT%H%M%SZ"))
     sub_args = types.SimpleNamespace(
-        key="%s%s-abort-%s" % (POWER_KEY_PREFIX, host,
-                               now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        key=key,
         program="syncyard", workflow=workflow, lane=lanes[0],
         script=script_path, grab_path=None, cwd=None, image=None,
         mounts=None, expected_min=1.0, maintenance=True,
         notify_chat=None)
     rc = cmd_submit(sub_args)
     if rc != 0:
-        return False, "abort job not accepted (submit rc=%d)" % rc
-    return True, "abort job queued via %s" % workflow
+        return False, "abort job not accepted (submit rc=%d)" % rc, None
+    return None, ("abort job queued via %s — payload verdict "
+                  "pending harvest" % workflow), key
 
 
 def _power_host_back(host, since_iso):
@@ -6267,6 +6430,107 @@ def _power_close(rec, verdict, detail=None):
     hlog("POWER VERDICT host=%s action=%s verdict=%s record=%s"
          % (rec["host"], rec["action"], verdict, rec["id"]))
     return rec
+
+
+def _power_job_by_key(jobs, key):
+    if not key:
+        return None
+    return next((j for j in jobs if j.get("key") == key), None)
+
+
+def _signal_markers(job):
+    """(verdict, detail) from a settled signal/abort job's
+    harvested POWER_SIGNAL_* markers."""
+    verdict = _power_marker(job.get("markers"),
+                            "POWER_SIGNAL_VERDICT")
+    detail = _power_marker(job.get("markers"),
+                           "POWER_SIGNAL_DETAIL")
+    return verdict, detail
+
+
+def _power_signal_settle(rec, jobs):
+    """Fold a settled Linux signal job's harvested payload
+    verdict into its action record (spec 042 amendment,
+    2026-11-17). Returns True when the record changed.
+
+    signal.ok starts None (queued — no verdict yet) and is
+    set ONLY from the job's POWER_SIGNAL_VERDICT marker:
+    OK confirms it and host-state settling proceeds; FAIL
+    closes the action UNVERIFIED with the payload's own
+    detail, immediately — the fleet must not wait out a
+    return window for a reboot the host already refused.
+    A job that concluded success WITHOUT the marker is
+    equally unproven (the amended body prints the marker
+    before it may exit 0) and closes UNVERIFIED. A job
+    that died with its host — an immediate action's runner
+    is killed by the very reboot it fired — carries no
+    marker and no success conclusion; that shape is left
+    to the observed-state settling, which owns it. The
+    closing-verdict discipline is unchanged: VERIFIED
+    still requires observed silence, then fresh identity."""
+    sig = rec.get("signal") or {}
+    if sig.get("verdict") is not None or not sig.get("job_key"):
+        return False
+    if HOST_TYPE.get(rec["host"]) != "linux":
+        return False
+    job = _power_job_by_key(jobs, sig["job_key"])
+    if job is None or job.get("state") != "completed":
+        return False
+    verdict, detail = _signal_markers(job)
+    if verdict == "OK":
+        sig["ok"] = True
+        sig["verdict"] = "OK"
+        if detail:
+            sig["payload_detail"] = detail
+        save_power_action(rec)
+        return True
+    if verdict == "FAIL":
+        sig["ok"] = False
+        sig["verdict"] = "FAIL"
+        if detail:
+            sig["payload_detail"] = detail
+        save_power_action(rec)
+        _power_close(rec, "UNVERIFIED",
+                     "signal payload verdict FAIL: %s"
+                     % (detail or "no detail marker"))
+        _set_host_power(rec["host"], power_state="UP")
+        return True
+    if job.get("run_conclusion") == "success":
+        sig["ok"] = False
+        sig["verdict"] = "MISSING"
+        save_power_action(rec)
+        _power_close(rec, "UNVERIFIED",
+                     "signal job concluded success without a "
+                     "POWER_SIGNAL_VERDICT marker — the "
+                     "signal is unproven")
+        _set_host_power(rec["host"], power_state="UP")
+        return True
+    return False
+
+
+def _power_abort_settle(rec, jobs):
+    """Record a settled Linux abort job's payload verdict
+    on the record's cancel section (spec 042 amendment,
+    2026-11-17). Informational only: FR-006 settles the
+    cancel verdict from observed host state, never from
+    the abort's exit — this keeps the record honest about
+    what the abort itself reported."""
+    c = rec.get("cancel") or {}
+    if c.get("abort_verdict") is not None \
+            or not c.get("abort_job_key"):
+        return False
+    if HOST_TYPE.get(rec["host"]) != "linux":
+        return False
+    job = _power_job_by_key(jobs, c["abort_job_key"])
+    if job is None or job.get("state") != "completed":
+        return False
+    verdict, detail = _signal_markers(job)
+    c["abort_verdict"] = verdict if verdict is not None \
+        else "MISSING"
+    if detail:
+        c["abort_payload_detail"] = detail
+    save_power_action(rec)
+    return True
 
 
 def _power_execute(rec, jobs):
@@ -6344,10 +6608,11 @@ def _power_execute(rec, jobs):
     ingest_going_down(gd, jobs=jobs)
     rec["going_down"] = {"host": host, "ts": ts}
     save_power_action(rec)
-    ok, detail = _power_signal(host, rec, route)
+    ok, detail, job_key = _power_signal(host, rec, route)
     rec["signal"] = {"route": route, "ok": ok, "detail": detail,
-                    "ts": now_iso()}
-    if not ok:
+                    "ts": now_iso(), "job_key": job_key,
+                    "verdict": "OK" if ok is True else None}
+    if ok is False:
         _power_close(rec, "UNVERIFIED",
                      "signal failed: %s" % detail)
         return "signal-failed", 1
@@ -6549,9 +6814,11 @@ def _power_cancel(args):
               "signal was immediate and carries no abort "
               "handle" % (host, rec["id"]))
         return 1
-    ok, detail = _power_abort_signal(host, rec)
+    ok, detail, job_key = _power_abort_signal(host, rec)
     rec["cancel"] = {"by": args.requested_by, "ts": now_iso(),
-                     "abort_ok": ok, "abort_detail": detail}
+                     "abort_ok": ok, "abort_detail": detail,
+                     "abort_job_key": job_key,
+                     "abort_verdict": None}
     rec["state"] = "CANCELLING"
     save_power_action(rec)
     print("POWER CANCEL SENT host=%s record=%s abort=%s — "
@@ -6606,6 +6873,8 @@ def power_pass(jobs=None):
                 settled += 1
             continue
         if rec["state"] == "CANCELLING":
+            if _power_abort_settle(rec, jobs):
+                settled += 1
             fire = parse_iso(rec.get("fire_at") or "")
             if fire is not None and now >= fire:
                 back, ev = _power_host_back(
@@ -6624,6 +6893,10 @@ def power_pass(jobs=None):
             continue
         if rec["state"] != "SIGNALED":
             continue
+        if _power_signal_settle(rec, jobs):
+            settled += 1
+            if rec.get("verdict"):
+                continue
         fire = parse_iso(rec.get("fire_at") or "")
         if rec["action"] == "reboot":
             if fire is None or now < fire:
