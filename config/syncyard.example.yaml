@@ -72,6 +72,41 @@ liveness:
 reboot:
   grace_s: 60
 
+# Controlled power (spec 042). `gk power --host <host>
+# --action reboot|poweroff|cancel` generalizes the reboot
+# verb. return_window_s is the expected-return window a
+# reboot opens at signal: the host must prove itself back
+# inside it or the action closes RETURN-MISSED and opens a
+# downtime record. confirm_down_s is the silence a poweroff
+# must be observed for (heartbeat and runners quiet for the
+# full window) before it closes CONFIRMED-DOWN. Failure
+# mode: a non-positive or non-numeric value fails closed
+# at load.
+power:
+  return_window_s: 900
+  confirm_down_s: 180
+
+# Fleet downtime records (spec 042). Push scope is the
+# owner's narrow ruling (2026-11-17): a downtime record
+# pushes ONLY when it escalates to NEEDS-PHYSICAL, and
+# only to the chats registered here (in practice the one
+# main chat). Open and close transitions are written to
+# the record and the ledger but never pushed; the Syncyard
+# chat, the Fleet umbrella, and the machine chats receive
+# no downtime pushes. An empty list means escalations
+# still ledger, they just push nowhere until the
+# registration lands.
+downtime:
+  escalation_chats: []
+  # The recovery ladder's bounds (defaults ratified
+  # 2026-11-17): the total budget before a record flips
+  # to NEEDS-PHYSICAL, the re-probe backoff schedule
+  # after the wake step, and the slow re-probe cadence
+  # that is the only automated act left after the flip.
+  ladder_budget_s: 1800
+  ladder_backoff_s: [120, 300, 600]
+  slow_reprobe_s: 3600
+
 # Checkpoint hold. The cooperative job-level
 # pause contract: at dispatch each script job is passed the
 # venue path of its own hold file (holds_dir for its workflow
@@ -143,7 +178,25 @@ lock:
 # fleet's Windows host; `desktop-wsl` is its WSL2 distro,
 # reached through it (its workflows ride the via host's
 # runner). A job addressed to a lane runs on that lane's host
-# or is refused — never silently rerouted.
+# or is refused — never silently rerouted. Two optional
+# spec 042 flags ride a host entry: `roaming: true` (a
+# shared / roaming machine — it never opens a downtime
+# record, never runs a recovery ladder, never pushes, at
+# any silence length) and `off_fleet: true` (not a
+# gatekeeper venue and not on the tailnet — no power verbs;
+# downtime records for it are hand-filed only). A third,
+# `physical_owner: <name>`, names who a NEEDS-PHYSICAL
+# escalation for the host goes to (default: the fleet
+# owner). Removing a host from an exception set is a config
+# change with the owner's name on it, never a default.
+# A host may also carry a `wol` block (spec 042 FR-010):
+# {mac: "aa:bb:cc:dd:ee:ff", via: <the LAN-resident fleet
+# host that sends the magic packet>, enabled: true}. The
+# host record distinguishes CONFIGURED from PROVEN (the
+# first observed wake) and records a failed first attempt
+# as FAILED. Wake-free by design (owner ruling 2026-11-17):
+# the roaming hosts carry no wol block, and macOS has no
+# wake step at all.
 hosts:
   desktop:
     type: windows

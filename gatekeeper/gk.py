@@ -23,6 +23,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import statistics
 import os
 import re
@@ -51,6 +52,11 @@ OUTBOX_CURSOR = os.path.join(BASE, "outbox-cursor.json")
 # between the read and the ack, and the iSMART chat never got the push.
 OUTBOX_READ = os.path.join(BASE, "outbox-read.json")
 HOSTS_FILE = os.path.join(BASE, "hosts.json")   # host liveness
+# Spec 042: one JSON record per controlled
+# power action, beside the queue, and the fleet downtime
+# record store (one open record per host + closed history).
+POWER_ACTIONS_DIR = os.path.join(BASE, "power-actions")
+DOWNTIME_FILE = os.path.join(BASE, "downtime.json")
 # Tray release cache: the sweep's last read of the
 # release manifest the tray updater itself consumes, cached at
 # sweep cadence beside the host records; `status` renders drift
@@ -195,6 +201,30 @@ DRAIN_WINDOW_S = _CFG["drain"]["window_s"]
 DRAIN_PER_LANE_WINDOW_S = dict(_CFG["drain"]["per_lane_window_s"])
 DRAIN_GUARD_STALE_S = _CFG["drain"]["guard_stale_after_s"]
 DRAIN_POLL_S = 2  # drain wait-loop poll cadence (tests may lower)
+# Controlled power (spec 042): the
+# expected-return window a reboot opens at signal and the
+# observed silence a poweroff needs before CONFIRMED-DOWN.
+POWER_RETURN_WINDOW_S = _CFG["power"]["return_window_s"]
+POWER_CONFIRM_DOWN_S = _CFG["power"]["confirm_down_s"]
+# Fleet downtime (spec 042): the
+# escalation push registration (owner ruling D4: the main
+# chat, escalation only) and the per-host exception flags
+# (roaming / off_fleet) with NEEDS-PHYSICAL owners.
+DOWNTIME_ESCALATION_CHATS = list(
+    _CFG["downtime"]["escalation_chats"])
+DOWNTIME_LADDER_BUDGET_S = _CFG["downtime"]["ladder_budget_s"]
+DOWNTIME_LADDER_BACKOFF_S = list(
+    _CFG["downtime"]["ladder_backoff_s"])
+DOWNTIME_SLOW_REPROBE_S = _CFG["downtime"]["slow_reprobe_s"]
+HOST_WOL = {n: dict(h["wol"]) for n, h in _CFG["hosts"].items()
+            if h.get("wol")}
+HOST_ROAMING = {n: bool(h.get("roaming"))
+                for n, h in _CFG["hosts"].items()}
+HOST_OFF_FLEET = {n: bool(h.get("off_fleet"))
+                  for n, h in _CFG["hosts"].items()}
+HOST_PHYSICAL_OWNER = {n: h.get("physical_owner")
+                       for n, h in _CFG["hosts"].items()
+                       if h.get("physical_owner")}
 # Priority optimizer: auto-assigned effective
 # priorities are capped at the ceiling (a human-set priority
 # above it is unreachable by any auto job) and age +1 per step.
@@ -1250,6 +1280,24 @@ def cmd_outbox(args):
         # an override suspend/resume. Same-holder actions
         # carry no address, so nothing self-notifies.
         evname = ev.get("event")
+        if evname == "downtime_notify":
+            # Spec 042 downtime pushes: the
+            # event carries its own address (one event per
+            # target chat per state transition), like the
+            # lane-lock notices below.
+            chat = ev.get("notify_chat")
+            if chat:
+                groups.setdefault(chat, []).append(
+                    "[downtime] %s %s class=%s first-detected %s "
+                    "last-seen-alive %s jobs affected %s record %s"
+                    % (ev.get("host") or "?",
+                       ev.get("transition") or "?",
+                       ev.get("class") or "?",
+                       ev.get("first_detected") or "?",
+                       ev.get("last_seen_alive") or "unknown",
+                       ev.get("jobs_affected", 0),
+                       ev.get("record_id") or "?"))
+            continue
         if evname in ("lock_expired", "lock_released_override",
                       "lock_suspended", "lock_resumed"):
             chat = ev.get("notify_chat")
@@ -2319,7 +2367,7 @@ def dispatch_one(job, jobs):
 def _signal_hold_exempt(job):
     """route 2 exception: the gatekeeper's own signal
     jobs (maintenance jobs keyed gk-reboot-*, gk-hold-* or
-    gk-unhold-*) are exempt from a host dispatch hold. The
+    gk-unhold-* or gk-power-*) are exempt from a host dispatch hold. The
     hold exists to stop NEW work starting on a host that is
     going down; a signal job is not new work, it IS the
     going-down / drain mechanism — if the hold blocked it,
@@ -2329,7 +2377,8 @@ def _signal_hold_exempt(job):
     dispatch pass and the fleet snapshot's held marks."""
     return bool(job.get("maintenance")) and str(
         job.get("key") or "").startswith(
-            (REBOOT_KEY_PREFIX, "gk-hold-", "gk-unhold-"))
+            (REBOOT_KEY_PREFIX, "gk-hold-", "gk-unhold-",
+             "gk-power-"))
 
 
 # --- Adaptive lanes: capability, history, auto routing -----------
@@ -3872,6 +3921,33 @@ def cmd_sweep(_args):
         if not lerr:
             changes, breaches = watch_pass(jobs, runs_by_id)
             maybe_settle_drain(jobs)
+            # Controlled power (spec 042): fire
+            # due scheduled actions and settle open ones
+            # (boot-back verification, CONFIRMED-DOWN,
+            # cancel verdicts) from observed host state.
+            # Contained like the staging pass: a power
+            # failure never breaks the fleet's only watcher.
+            try:
+                _settled = power_pass(jobs)
+                if _settled:
+                    hlog("POWER pass: settled %d action(s)"
+                         % _settled)
+            except Exception as _exc:
+                ledger("power_pass_error", error=str(_exc)[:200])
+                hlog("POWER pass error: %s" % _exc)
+            # Recovery ladder (spec 042): one
+            # stage per open downtime record per sweep,
+            # plus the slow re-probe for flipped records.
+            # Contained the same way.
+            try:
+                _touched = ladder_pass(jobs)
+                if _touched:
+                    hlog("LADDER pass: touched %d record(s)"
+                         % _touched)
+            except Exception as _exc:
+                ledger("ladder_pass_error",
+                       error=str(_exc)[:200])
+                hlog("LADDER pass error: %s" % _exc)
             # Staging store (FBB-1): one pending-staging job per
             # sweep pass. A staging failure must never break the
             # fleet's only watcher, so the pass is fully contained.
@@ -4053,7 +4129,7 @@ def backchannel_status_line():
 # stale heartbeat never blocks dispatch in this phase.
 
 GOING_DOWN_TRIGGERS = ("shutdown", "logoff", "update", "unknown",
-                       "remote-reboot")
+                       "remote-reboot", "remote-poweroff")
 
 
 def load_hosts_state():
@@ -4117,8 +4193,10 @@ def sweep_liveness(jobs):
         return state
     ts = parse_iso(hb["ts"])
     age = (now_dt() - ts).total_seconds() if ts else None
+    was_down = {}
     for host in heartbeat_hosts():
         rec = _host_record(state, host)
+        was_down[host] = bool(rec.get("down"))
         rec["last_seen"] = now_iso()
         rec["last_heartbeat_ts"] = hb["ts"]
         rec["down"] = bool(age is not None
@@ -4136,6 +4214,17 @@ def sweep_liveness(jobs):
     tray = hb.get("tray")
     if isinstance(tray, dict) and tray:
         _record_tray_beat(tray, hb.get("ts"))
+    # Spec 042 downtime detection: a
+    # liveness down-transition (with no DOWN-BY-ACTION
+    # expected state) opens the host's downtime record; a
+    # return closes an open one. Fully contained — a
+    # downtime failure never breaks the liveness pass.
+    for host in heartbeat_hosts():
+        try:
+            _downtime_detect(host, was_down.get(host, False), jobs)
+        except Exception as exc:
+            ledger_soft("downtime_detect_error", host=host,
+                        error=str(exc)[:200])
     return state
 
 
@@ -4504,7 +4593,9 @@ def host_status_lines(state=None):
         rec = state.get(host) or {}
         hb_ts = parse_iso(rec.get("last_heartbeat_ts"))
         if hb_ts is None:
-            out.append("host %s: UNKNOWN (no heartbeat seen)" % host)
+            line = "host %s: UNKNOWN (no heartbeat seen)" % host
+            line += _power_line_suffix(rec)
+            out.append(line)
             continue
         age = int((now_dt() - hb_ts).total_seconds())
         down = bool(rec.get("hold")) or age > LIVENESS_DOWN_AFTER_S
@@ -4550,8 +4641,33 @@ def host_status_lines(state=None):
                 line += " — tray drift current"
             else:
                 line += " — tray drift unknown"
+        line += _power_line_suffix(rec)
         out.append(line)
     return out
+
+
+def _power_line_suffix(rec):
+    """The spec 042 power section of a host status line
+    (FR-008): rendered only when the host carries one, so
+    a host with no power history renders exactly as
+    before. A planned-down host (DOWN-BY-ACTION) and a
+    crashed host (plain DOWN) never render identically."""
+    power = rec.get("power")
+    if not power:
+        return ""
+    line = " — power %s" % (power.get("power_state")
+                            or "UNKNOWN")
+    la = power.get("last_action")
+    if la:
+        line += " (last action %s by %s at %s%s)" % (
+            la.get("action"), la.get("requested_by"),
+            la.get("ts"),
+            (", verdict %s" % la["verdict"])
+            if la.get("verdict") else "")
+    if power.get("expected_return_by"):
+        line += " expected back by %s" % (
+            power["expected_return_by"])
+    return line
 
 
 def cmd_host_resume(args):
@@ -5287,26 +5403,30 @@ def _drain_probe(tracked):
         watch_pass(tracked, runs)
 
 
-def cmd_drain(args):
-    host = args.host
-    if host not in _CFG["hosts"]:
-        print("ERROR: unknown host '%s' (config hosts: %s)"
-              % (host, ", ".join(sorted(_CFG["hosts"]))))
-        return 2
-    jobs = load_jobs()
+def _drain_host(host, requested_by, window=None, jobs=None):
+    """The host drain itself (spec 011 Phase 2),
+    shared by `gk drain` and the spec 042 power verb:
+    signal the tracked jobs' checkpoint holds, set the
+    host's drain hold, wait out the per-lane windows, and
+    return the verdict as data. The ledger pair
+    (host_drain_started / host_drain_verdict) is written
+    here, exactly as `gk drain` has always written it; the
+    caller renders the verdict in its own words."""
+    if jobs is None:
+        jobs = load_jobs()
     tracked = _drain_tracked_jobs(host, jobs)
     lanes = set(_host_lanes(host))
     queued = [j for j in jobs if j.get("lane") in lanes
               and j["state"] == "submitted"
               and not j.get("maintenance")]
     started = now_iso()
-    if args.window is not None:
-        windows = {j["id"]: float(args.window) for j in tracked}
+    if window is not None:
+        windows = {j["id"]: float(window) for j in tracked}
     else:
         windows = {j["id"]: float(drain_window_for_lane(j["lane"]))
                    for j in tracked}
     ledger("host_drain_started", host=host,
-           requested_by=args.requested_by, tracked=len(tracked),
+           requested_by=requested_by, tracked=len(tracked),
            queued_waiting=len(queued))
     hlog("HOST_DRAIN host=%s tracked=%d at %s"
          % (host, len(tracked), started))
@@ -5332,7 +5452,7 @@ def cmd_drain(args):
     rec = _host_record(state, host)
     rec["drain_hold"] = True
     rec["drain_since"] = started
-    rec["drain_by"] = args.requested_by
+    rec["drain_by"] = requested_by
     save_hosts_state(state)
     # 3. Wait out the windows. Each tracked job is classified
     # at its own lane's deadline: checkpointed
@@ -5365,7 +5485,7 @@ def cmd_drain(args):
                 outcomes[j["id"]] = "uncheckpointed"
             break
         time.sleep(DRAIN_POLL_S if DRAIN_POLL_S > 0 else 0.05)
-    # 4. The verdict, in plain language.
+    # 4. The verdict, as data.
     by_id = {j["id"]: j for j in tracked}
     checkpointed = [i for i, o in outcomes.items()
                     if o == "held_at_checkpoint"]
@@ -5379,6 +5499,40 @@ def cmd_drain(args):
            checkpointed=checkpointed, finished=finished,
            ended=ended, uncheckpointed=uncp,
            signal_failed=signal_failed)
+    whys = {}
+    for i in uncp:
+        j = by_id[i]
+        if j.get("workflow") not in CHECKPOINT_HOLDS_DIR:
+            whys[i] = ("it runs %s, which has no checkpoint hold "
+                       "venue" % j.get("workflow"))
+        elif i in signal_failed:
+            whys[i] = "its hold signal could not be queued"
+        else:
+            whys[i] = ("it did not honor the checkpoint hold "
+                       "inside its window (%gs)" % windows[i])
+    return {"host": host, "tracked": tracked, "queued": queued,
+            "by_id": by_id, "windows": windows,
+            "checkpointed": checkpointed, "finished": finished,
+            "ended": ended, "uncheckpointed": uncp,
+            "signal_failed": signal_failed, "whys": whys,
+            "clean": clean, "started": started}
+
+
+def cmd_drain(args):
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    d = _drain_host(host, args.requested_by, window=args.window)
+    tracked = d["tracked"]
+    queued = d["queued"]
+    by_id = d["by_id"]
+    checkpointed = d["checkpointed"]
+    finished = d["finished"]
+    ended = d["ended"]
+    uncp = d["uncheckpointed"]
+    clean = d["clean"]
     print("DRAIN host=%s — tracked %d running job(s), %d queued "
           "job(s) waiting under the drain hold"
           % (host, len(tracked), len(queued)))
@@ -5394,15 +5548,7 @@ def cmd_drain(args):
               % (i, by_id[i].get("key")))
     for i in uncp:
         j = by_id[i]
-        if j.get("workflow") not in CHECKPOINT_HOLDS_DIR:
-            why = ("it runs %s, which has no checkpoint hold "
-                   "venue" % j.get("workflow"))
-        elif i in signal_failed:
-            why = "its hold signal could not be queued"
-        else:
-            why = ("it did not honor the checkpoint hold "
-                   "inside its window (%gs)"
-                   % windows[i])
+        why = d["whys"][i]
         print("  UNCHECKPOINTED %s key=%s — %s; if the host "
               "goes down now this job is interrupted and its "
               "in-flight work is lost (resubmission is the "
@@ -5420,6 +5566,1634 @@ def cmd_drain(args):
           "Dispatch to the host stays held until "
           "`gk host-resume %s`." % (host, len(uncp), host))
     return 1
+
+
+# --- Fleet downtime records (spec 042, FR-011..FR-013, FR-016) ------------
+#
+# One record per (host, incident), keyed by the host while
+# open: the fleet's standing account of a machine being
+# down. Detectors conclude a host is down (the sweep
+# liveness transition, a power action's missed return
+# window, an unreturned non-initiated going-down, an
+# operator's hand filing); the FIRST detection opens the
+# record, later detections of the same incident append
+# evidence and detectors only — no second record, no
+# second push. The class comes from evidence only, never
+# from a guess. Push scope is the owner's narrow ruling
+# (2026-11-17, decision D4): ONLY the flip to
+# NEEDS-PHYSICAL pushes, exactly once per registered
+# escalation target (the main chat), through the ledger
+# outbox (downtime_notify events, rendered by cmd_outbox).
+# Open and close transitions are written to the record
+# and the ledger but never pushed; ladder progress never
+# pushes either.
+#
+# FR-016 exceptions are enforced here, in code: a host
+# flagged roaming in config never opens a record at any
+# silence length, whatever the detector; a host flagged
+# off_fleet opens records by hand filing only.
+
+DOWNTIME_CLASSES = ("ORDERLY", "BY-ACTION", "NETWORK", "UNKNOWN")
+DOWNTIME_CLOSINGS = ("RECOVERED-BY-LADDER", "RECOVERED-UNASSISTED")
+
+
+def load_downtime():
+    """The downtime store: {"open": {host: record},
+    "closed": [record, ...]}. A missing or unreadable store
+    reads as empty — the next detection re-opens what it
+    must, and the ledger keeps the durable account."""
+    try:
+        with open(DOWNTIME_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("open", {})
+            data.setdefault("closed", [])
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"open": {}, "closed": []}
+
+
+def save_downtime(data):
+    _write_text_file(DOWNTIME_FILE,
+                     json.dumps(data, indent=2, sort_keys=True))
+
+
+def downtime_open_record(host):
+    return load_downtime()["open"].get(host)
+
+
+def _downtime_push(rec):
+    """Ledger the ONE downtime push the ruling allows:
+    the NEEDS-PHYSICAL escalation, one downtime_notify
+    event per registered escalation chat. The caller
+    guarantees exactly-once by recording the transition in
+    rec["pushes"] before saving; the outbox renders each
+    event once, addressed by the event itself (the
+    lane-lock notice pattern). The push names the fields
+    FR-013 lists: machine, state, first-detected,
+    last-seen-alive, class, jobs-affected count, record
+    id."""
+    count = len((rec.get("jobs_affected") or {}).get("interrupted")
+                or []) + len((rec.get("jobs_affected") or {})
+                             .get("waiting") or [])
+    for chat in DOWNTIME_ESCALATION_CHATS:
+        ledger("downtime_notify", notify_chat=chat,
+               host=rec["host"], transition="NEEDS-PHYSICAL",
+               record_id=rec["id"], state=rec["state"],
+               **{"class": rec["class"]},
+               first_detected=rec["first_detected"],
+               last_seen_alive=rec.get("last_seen_alive"),
+               jobs_affected=count,
+               detector=rec["detectors"][0])
+
+
+def downtime_classify(evidence):
+    """(class, evidence lines) from evidence only
+    (FR-012). evidence keys: going_down (a stored
+    going-down record or None), open_action (an open power
+    action record or None), lan_reachable (True when a
+    LAN-resident prober still reaches the host while its
+    heartbeat/tailnet presence is gone, else None/False),
+    mid_job (a job was in flight when contact was lost).
+    No evidence for a stronger class is UNKNOWN — a class
+    is never upgraded on a guess."""
+    lines = []
+    gd = evidence.get("going_down")
+    if evidence.get("open_action"):
+        a = evidence["open_action"]
+        lines.append("initiated power action %s (%s, requested "
+                     "by %s) is open for this window"
+                     % (a.get("id"), a.get("action"),
+                        a.get("requested_by")))
+        return "BY-ACTION", lines
+    if gd:
+        lines.append("going-down record at %s (trigger %s) "
+                     "covers this window"
+                     % (gd.get("ts"), gd.get("trigger")))
+        return "ORDERLY", lines
+    if evidence.get("lan_reachable"):
+        lines.append("heartbeat / tailnet presence lost while "
+                     "a LAN-resident prober still reaches the "
+                     "host — the machine is up, a network path "
+                     "is down")
+        return "NETWORK", lines
+    if evidence.get("mid_job"):
+        lines.append("heartbeat lost mid-job; no going-down "
+                     "record; no channel answers")
+    else:
+        lines.append("no going-down record; no initiated "
+                     "action; no channel answers")
+    return "UNKNOWN", lines
+
+
+def _downtime_jobs_affected(host, jobs):
+    """Jobs-affected accounting from the gatekeeper's own
+    records at detection (FR-012): jobs active on the host
+    (interrupted) and jobs queued for it (waiting), each
+    named."""
+    lanes = set(_host_lanes(host))
+    interrupted, waiting = [], []
+    for j in jobs or []:
+        if j.get("lane") not in lanes or j.get("maintenance"):
+            continue
+        if j["state"] in RUN_HOLDING_STATES \
+                and j.get("run_status") != "completed":
+            interrupted.append(j["id"])
+        elif j["state"] == "submitted":
+            waiting.append(j["id"])
+    return {"interrupted": interrupted, "waiting": waiting}
+
+
+def open_downtime(host, detector, evidence=None, note=None,
+                  jobs=None):
+    """Open the host's downtime record, or append to the
+    one already open. Returns the record, or None when the
+    FR-016 exceptions refuse the opening: roaming hosts
+    never open; off_fleet hosts open by hand filing
+    (detector "operator") only. Opening never pushes
+    (ruling D4); a re-detection changes nothing but the
+    record's evidence."""
+    if HOST_ROAMING.get(host):
+        return None
+    if HOST_OFF_FLEET.get(host) and detector != "operator":
+        return None
+    if jobs is None:
+        jobs = load_jobs()
+    data = load_downtime()
+    existing = data["open"].get(host)
+    if existing is not None:
+        changed = False
+        if detector not in existing["detectors"]:
+            existing["detectors"].append(detector)
+            changed = True
+        for line in (evidence or {}).get("extra_lines") or []:
+            if line not in existing["evidence"]:
+                existing["evidence"].append(line)
+                changed = True
+        if note and note not in (existing.get("notes") or []):
+            existing.setdefault("notes", []).append(note)
+            changed = True
+        if changed:
+            save_downtime(data)
+        return existing
+    ev = dict(evidence or {})
+    cls, lines = downtime_classify(ev)
+    for line in ev.get("extra_lines") or []:
+        if line not in lines:
+            lines.append(line)
+    state = load_hosts_state()
+    hrec = state.get(host) or {}
+    rec = {
+        "id": new_job_id("downtime-%s" % host),
+        "host": host,
+        "first_detected": now_iso(),
+        "detector": detector,
+        "detectors": [detector],
+        "last_seen_alive": hrec.get("last_heartbeat_ts"),
+        "class": cls,
+        "evidence": lines,
+        "jobs_affected": _downtime_jobs_affected(host, jobs),
+        "state": "OPEN",
+        "ladder": [],
+        "pushes": [],
+        "physical_owner": HOST_PHYSICAL_OWNER.get(host)
+                          or "Tristen Pierson",
+        "notes": [note] if note else [],
+        "closed_at": None,
+        "closing": None,
+    }
+    if cls != "BY-ACTION":
+        # The recovery ladder (FR-014) arms at
+        # opening; ladder_pass runs its steps on the sweep
+        # cadence. BY-ACTION records never ladder — the
+        # action's own machinery owns that host's return.
+        rec["ladder_state"] = {
+            "started_at": rec["first_detected"], "stage": "start",
+            "backoff_idx": 0, "next_due": None,
+            "reboot_action": None, "wake_attempted": False,
+            "active_step": None, "first_probe": None,
+            "last_slow_reprobe": None}
+    data["open"][host] = rec
+    save_downtime(data)
+    ledger("downtime_opened", host=host, record_id=rec["id"],
+           detector=detector, **{"class": cls},
+           first_detected=rec["first_detected"],
+           last_seen_alive=rec["last_seen_alive"])
+    hlog("DOWNTIME OPEN host=%s class=%s detector=%s record=%s"
+         % (host, cls, detector, rec["id"]))
+    return rec
+
+
+def _downtime_checklist(rec):
+    """The on-site checklist carried by a NEEDS-PHYSICAL
+    flip (FR-015): per-class lines, plus the standing
+    physical checks. Written for the hand-filed
+    layer1labs-inference case as much as any other — the
+    record is what the person on site works from."""
+    lines = ["confirm power at the machine (PSU switch, "
+             "breaker, UPS state)",
+             "confirm the network cable and dock connection "
+             "where the host has one",
+             "look for a boot prompt on the console (disk "
+             "unlock / passphrase prompts included)"]
+    if rec["class"] == "NETWORK":
+        lines.append("the machine was reachable on the LAN "
+                     "at classification: check the switch "
+                     "port, the cable run, and the tailnet "
+                     "client state before power work")
+    if rec["class"] == "ORDERLY":
+        lines.append("the host announced its own shutdown "
+                     "(see the record's evidence): check for "
+                     "a pending update or a stopped boot "
+                     "before forcing power")
+    lines.append("do not force power cycles beyond one "
+                 "attempt without the named owner")
+    return lines
+
+
+def escalate_downtime(host, by="operator"):
+    """Flip the host's open record to NEEDS-PHYSICAL
+    (FR-015): the named owner and the on-site checklist
+    attach to the record, and the flip pushes exactly once
+    per escalation target — the only downtime push there
+    is (ruling D4). Returns the record, or None when no
+    record is open. A repeat flip is a no-op (no second
+    push)."""
+    data = load_downtime()
+    rec = data["open"].get(host)
+    if rec is None or rec["state"] == "NEEDS-PHYSICAL":
+        return rec
+    rec["state"] = "NEEDS-PHYSICAL"
+    rec["physical"] = {
+        "owner": rec["physical_owner"],
+        "flipped_at": now_iso(),
+        "flipped_by": by,
+        "checklist": _downtime_checklist(rec),
+        "ladder_so_far": list(rec.get("ladder") or []),
+    }
+    save_downtime(data)
+    ledger("downtime_escalated", host=host, record_id=rec["id"],
+           owner=rec["physical_owner"], by=by)
+    hlog("DOWNTIME NEEDS-PHYSICAL host=%s owner=%s record=%s"
+         % (host, rec["physical_owner"], rec["id"]))
+    if "NEEDS-PHYSICAL" not in rec["pushes"]:
+        rec["pushes"].append("NEEDS-PHYSICAL")
+        _downtime_push(rec)
+        save_downtime(data)
+    return rec
+
+
+def close_downtime(host, closing, account=None):
+    """Close the host's open record exactly once
+    (FR-011): the record moves to the closed history with
+    its closing state and account. Closing never pushes
+    (ruling D4). Returns the closed record, or None when
+    no record is open."""
+    if closing not in DOWNTIME_CLOSINGS:
+        raise ValueError("unknown downtime closing %r" % closing)
+    data = load_downtime()
+    rec = data["open"].pop(host, None)
+    if rec is None:
+        return None
+    rec["state"] = closing
+    rec["closing"] = closing
+    rec["closed_at"] = now_iso()
+    rec["closing_account"] = account or ""
+    data["closed"].append(rec)
+    save_downtime(data)
+    ledger("downtime_closed", host=host, record_id=rec["id"],
+           closing=closing)
+    hlog("DOWNTIME CLOSED host=%s closing=%s record=%s"
+         % (host, closing, rec["id"]))
+    return rec
+
+
+def _downtime_detect(host, was_down, jobs):
+    """The sweep detector (FR-011): judge the host's
+    liveness transition this pass. Down with no
+    DOWN-BY-ACTION expected state opens a record (class
+    from the stored evidence); back closes an open one as
+    RECOVERED-UNASSISTED. Roaming hosts are refused inside
+    open_downtime itself."""
+    state = load_hosts_state()
+    rec = state.get(host) or {}
+    down = bool(rec.get("down"))
+    if down and not was_down:
+        if (rec.get("power") or {}).get("power_state") \
+                == "DOWN-BY-ACTION":
+            return
+        lanes = set(_host_lanes(host))
+        mid_job = any(
+            j.get("lane") in lanes and not j.get("maintenance")
+            and j["state"] in RUN_HOLDING_STATES
+            and j.get("run_status") != "completed"
+            for j in jobs or [])
+        open_downtime(host, "sweep-liveness",
+                      evidence={"going_down": rec.get("going_down"),
+                                "mid_job": mid_job},
+                      jobs=jobs)
+    elif not down and was_down:
+        if downtime_open_record(host) is not None:
+            close_downtime(
+                host, "RECOVERED-UNASSISTED",
+                account="heartbeat fresh again at %s"
+                        % rec.get("last_heartbeat_ts"))
+
+
+def cmd_downtime(args):
+    """`gk downtime --host <host> [--note <text>]` —
+    hand-file (or append to) the host's downtime record;
+    --escalate flips it to NEEDS-PHYSICAL; --close closes
+    it as RECOVERED-UNASSISTED with the operator's account.
+    """
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    if args.escalate:
+        rec = escalate_downtime(host, by=args.requested_by
+                                or "operator")
+        if rec is None:
+            print("DOWNTIME host=%s — no open record to "
+                  "escalate" % host)
+            return 1
+        print("DOWNTIME host=%s NEEDS-PHYSICAL owner=%s "
+              "record=%s" % (host, rec["physical_owner"],
+                             rec["id"]))
+        return 0
+    if args.close:
+        rec = close_downtime(host, "RECOVERED-UNASSISTED",
+                             account=args.note
+                             or "closed by operator")
+        if rec is None:
+            print("DOWNTIME host=%s — no open record to close"
+                  % host)
+            return 1
+        print("DOWNTIME host=%s CLOSED %s record=%s"
+              % (host, rec["closing"], rec["id"]))
+        return 0
+    rec = open_downtime(host, "operator", note=args.note)
+    if rec is None:
+        print("DOWNTIME host=%s — no record opened: the host "
+              "is excepted (FR-016)" % host)
+        return 1
+    print("DOWNTIME host=%s state=%s class=%s record=%s "
+          "first-detected %s last-seen-alive %s"
+          % (host, rec["state"], rec["class"], rec["id"],
+             rec["first_detected"],
+             rec.get("last_seen_alive") or "unknown"))
+    return 0
+
+
+# --- Controlled power (spec 042, FR-001..FR-007) ---------------------------
+#
+# `gk power` generalizes `gk reboot` (which stays, a
+# byte-identical compatibility alias) to reboot / poweroff
+# / cancel over every host OS the fleet runs. Route proof
+# is spec 011's, unchanged (_reboot_route): the backchannel
+# when the host's heartbeat proves it, else a maintenance
+# dispatch to a door runner that proves the host, else
+# POWER UNREACHABLE. Drain-before-signal reuses spec 011's
+# drain machinery unchanged (_drain_host). Every initiated
+# action writes one action record beside the queue, and
+# its closing verdict is the PAYLOAD verdict — the host's
+# observed state, settled by power_pass — never "signal
+# sent". macOS takes no initiated power action in this
+# spec (Part D: designed, not built); off-fleet hosts take
+# no power verbs at all (FR-016).
+
+POWER_KEY_PREFIX = "gk-power-"
+POWER_SIGNAL_TEXT = "Syncyard gatekeeper power"
+POWER_ACTIONS = ("reboot", "poweroff")
+POWER_OPEN_STATES = ("OPEN", "SCHEDULED", "SIGNALED", "CANCELLING")
+POWER_VERDICTS = ("VERIFIED", "VERIFIED-LATE", "RETURN-MISSED",
+                  "CONFIRMED-DOWN", "CANCELLED-CONFIRMED",
+                  "CANCEL-FAILED", "NOT-CANCELLABLE",
+                  "UNREACHABLE", "REFUSED", "UNVERIFIED")
+_POWER_CLOSE_EVENTS = {
+    "VERIFIED": "host_power_verified",
+    "VERIFIED-LATE": "host_power_verified",
+    "RETURN-MISSED": "host_power_return_missed",
+    "CONFIRMED-DOWN": "host_power_confirmed_down",
+    "CANCELLED-CONFIRMED": "host_power_cancelled",
+    "CANCEL-FAILED": "host_power_cancelled",
+    "REFUSED": "host_power_refused",
+    "UNREACHABLE": "host_power_unreachable",
+}
+
+
+def _power_path(action_id):
+    return os.path.join(POWER_ACTIONS_DIR, action_id + ".json")
+
+
+def save_power_action(rec):
+    """Persist a power action record with the same
+    discipline as save_job: WRITE-VERIFY-RETRY to a temp
+    file, atomic swap, verify at the final path. Raises
+    IOError when no attempt lands, leaving any prior record
+    standing."""
+    payload = json.dumps(rec, indent=2, sort_keys=True).encode(
+        "utf-8")
+    os.makedirs(POWER_ACTIONS_DIR, exist_ok=True)
+    final = _power_path(rec["id"])
+    tmps = []
+    try:
+        for i in range(8):
+            tmp = os.path.join(
+                POWER_ACTIONS_DIR, ".%s.%d.%d.%s.tmp"
+                % (rec["id"], os.getpid(), i, uuid.uuid4().hex[:6]))
+            tmps.append(tmp)
+            if _write_verified_bytes(tmp, payload):
+                try:
+                    os.replace(tmp, final)
+                except OSError:
+                    pass
+                else:
+                    try:
+                        with open(final, "rb") as f:
+                            landed = f.read()
+                    except OSError:
+                        landed = None
+                    if landed == payload:
+                        _fsync_dir(POWER_ACTIONS_DIR)
+                        return
+            if i + 1 < 8:
+                time.sleep(min(0.25 * (2 ** i), 8.0))
+        raise IOError("save_power_action could not verify a "
+                      "write for action %s" % rec["id"])
+    finally:
+        for t in tmps:
+            try:
+                os.unlink(t)
+            except OSError:
+                pass
+
+
+def load_power_actions():
+    out = []
+    try:
+        names = os.listdir(POWER_ACTIONS_DIR)
+    except OSError:
+        return out
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(POWER_ACTIONS_DIR, name),
+                      encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    out.sort(key=lambda a: a.get("created_at") or "")
+    return out
+
+
+def _open_power_actions(host=None):
+    return [a for a in load_power_actions()
+            if not a.get("verdict")
+            and (host is None or a.get("host") == host)]
+
+
+def _set_host_power(host, **kw):
+    """Merge fields into the host liveness record's power
+    section (FR-008). Values are taken as given — pass
+    expected_return_by=None to clear it."""
+    state = load_hosts_state()
+    rec = _host_record(state, host)
+    pw = rec.get("power")
+    if not isinstance(pw, dict):
+        pw = {"power_state": "UNKNOWN", "last_action": None,
+              "expected_return_by": None}
+        rec["power"] = pw
+    pw.update(kw)
+    save_hosts_state(state)
+    return pw
+
+
+def _power_last_action(rec, verdict=None):
+    return {"id": rec["id"], "action": rec["action"],
+            "requested_by": rec["requested_by"],
+            "ts": rec.get("signaled_at") or rec["created_at"],
+            "verdict": verdict}
+
+
+def _power_body(host, action, delay_s):
+    """The OS command body for a power signal, or None
+    when the host's OS takes no initiated power action
+    (macOS, FR-001). Windows/WSL2 ride shutdown.exe exactly
+    as `gk reboot` sends it; Linux rides shutdown(8) with a
+    minute delay when a grace was asked (which is what
+    makes it cancellable), systemctl when immediate."""
+    os_ = HOST_TYPE.get(host)
+    if os_ in ("windows", "wsl2"):
+        verb = "/r" if action == "reboot" else "/s"
+        return ("/mnt/c/Windows/System32/shutdown.exe %s /t %d "
+                "/c \"%s\"" % (verb, int(delay_s),
+                               POWER_SIGNAL_TEXT))
+    if os_ == "linux":
+        if delay_s and delay_s > 0:
+            mins = max(1, int(math.ceil(delay_s / 60.0)))
+            return "shutdown %s +%d \"%s\"" % (
+                "-r" if action == "reboot" else "-h", mins,
+                POWER_SIGNAL_TEXT)
+        return "systemctl %s" % (
+            "reboot" if action == "reboot" else "poweroff")
+    return None
+
+
+def _power_abort_body(host):
+    """The OS abort body for an in-grace action, or None
+    when the OS has none reachable this way."""
+    os_ = HOST_TYPE.get(host)
+    if os_ in ("windows", "wsl2"):
+        return "/mnt/c/Windows/System32/shutdown.exe /a"
+    if os_ == "linux":
+        return "shutdown -c"
+    return None
+
+
+def _power_signal(host, rec, route):
+    """Send the action's signal over a proven route.
+    Returns (ok, detail). The two transports are spec
+    011's, unchanged: a backchannel command, or a
+    maintenance job through the existing submit machinery
+    (hold-exempt under the gk-power- key prefix)."""
+    body = _power_body(host, rec["action"], rec["delay_s"])
+    if body is None:
+        return False, "no initiated power action for this host OS"
+    if route == "backchannel":
+        bc = _bc_client_path()
+        if bc is None:
+            return False, "backchannel client (bc.py) not found"
+        rc, out, err = run_cmd([sys.executable, bc, "send",
+                                "--cmd", body], timeout=120)
+        if rc != 0:
+            return False, "bc send rc=%d: %s" % (
+                rc, (err or out or "").strip()[:200])
+        return True, "backchannel send ok"
+    lanes = _host_lanes(host)
+    if not lanes:
+        return False, "no lane is configured for this host"
+    os_ = HOST_TYPE.get(host)
+    if os_ == "linux":
+        workflow = "linux.yml"
+        script_name = "power-signal-%s.sh" % host
+        script = "#!/bin/sh\n%s\nexit 0\n" % body
+    else:
+        workflow = "run.yml"
+        script_name = "power-signal-%s.ps1" % host
+        exe = body.replace("/mnt/c/Windows/System32/", "")
+        script = "%s; exit 0\n" % exe
+    script_path = os.path.join(BASE, script_name)
+    try:
+        _write_text_file(script_path, script)
+    except (IOError, OSError) as exc:
+        return False, "could not write the signal script (%s)" % exc
+    sub_args = types.SimpleNamespace(
+        key="%s%s-%s-%s" % (POWER_KEY_PREFIX, host, rec["action"],
+                            now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        program="syncyard", workflow=workflow, lane=lanes[0],
+        script=script_path, grab_path=None, cwd=None, image=None,
+        mounts=None, expected_min=1.0, maintenance=True,
+        notify_chat=None)
+    rc = cmd_submit(sub_args)
+    if rc != 0:
+        return False, "signal job not accepted (submit rc=%d)" % rc
+    return True, "signal job queued via %s" % workflow
+
+
+def _power_abort_signal(host, rec):
+    """Send the OS abort for an in-grace action over the
+    route the action itself signaled on. (ok, detail)."""
+    body = _power_abort_body(host)
+    if body is None:
+        return False, "no abort body for this host OS"
+    route = (rec.get("signal") or {}).get("route")
+    if route == "backchannel":
+        bc = _bc_client_path()
+        if bc is None:
+            return False, "backchannel client (bc.py) not found"
+        rc, out, err = run_cmd([sys.executable, bc, "send",
+                                "--cmd", body], timeout=120)
+        if rc != 0:
+            return False, "bc send rc=%d: %s" % (
+                rc, (err or out or "").strip()[:200])
+        return True, "backchannel abort sent"
+    lanes = _host_lanes(host)
+    if not lanes:
+        return False, "no lane is configured for this host"
+    os_ = HOST_TYPE.get(host)
+    if os_ == "linux":
+        workflow = "linux.yml"
+        script_name = "power-abort-%s.sh" % host
+        script = "#!/bin/sh\n%s\nexit 0\n" % body
+    else:
+        workflow = "run.yml"
+        script_name = "power-abort-%s.ps1" % host
+        script = "%s; exit 0\n" % body.replace(
+            "/mnt/c/Windows/System32/", "")
+    script_path = os.path.join(BASE, script_name)
+    try:
+        _write_text_file(script_path, script)
+    except (IOError, OSError) as exc:
+        return False, "could not write the abort script (%s)" % exc
+    sub_args = types.SimpleNamespace(
+        key="%s%s-abort-%s" % (POWER_KEY_PREFIX, host,
+                               now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        program="syncyard", workflow=workflow, lane=lanes[0],
+        script=script_path, grab_path=None, cwd=None, image=None,
+        mounts=None, expected_min=1.0, maintenance=True,
+        notify_chat=None)
+    rc = cmd_submit(sub_args)
+    if rc != 0:
+        return False, "abort job not accepted (submit rc=%d)" % rc
+    return True, "abort job queued via %s" % workflow
+
+
+def _power_host_back(host, since_iso):
+    """(back, evidence): the host proves itself back with
+    evidence NEWER than `since_iso` — a heartbeat stamp
+    after it, or one of the host's runners online. This is
+    the FR-005 interim identity (fresh heartbeat + runner
+    state); records closed on it say so, and the spec 011
+    T014 handshake replaces the standard when it lands."""
+    state = load_hosts_state()
+    rec = state.get(host) or {}
+    hb_ts = rec.get("last_heartbeat_ts")
+    if hb_ts and since_iso and hb_ts > since_iso:
+        return True, "heartbeat %s" % hb_ts
+    data, err = gh_json(["api", "repos/%s/actions/runners" % REPO])
+    if not err and isinstance(data, dict):
+        for r in data.get("runners") or []:
+            if str(r.get("name") or "").startswith(host) \
+                    and r.get("status") == "online":
+                return True, "runner %s online" % r.get("name")
+    return False, "no heartbeat or runner evidence"
+
+
+def _power_close(rec, verdict, detail=None):
+    """Close an action record with its payload verdict:
+    stamp it, ledger the verdict's event from FR-007's
+    vocabulary, and carry the verdict onto the host's
+    power section. Returns the record."""
+    rec["verdict"] = verdict
+    rec["verdict_ts"] = now_iso()
+    if detail:
+        rec["verdict_detail"] = detail
+    save_power_action(rec)
+    ev = _POWER_CLOSE_EVENTS.get(verdict)
+    if ev:
+        ledger(ev, host=rec["host"], action=rec["action"],
+               record_id=rec["id"], verdict=verdict,
+               requested_by=rec["requested_by"])
+    state = {"VERIFIED": "UP", "VERIFIED-LATE": "UP",
+             "CANCELLED-CONFIRMED": "UP",
+             "RETURN-MISSED": "RETURN-MISSED",
+             "CANCEL-FAILED": "DOWN"}.get(verdict)
+    kw = {}
+    if state:
+        kw["power_state"] = state
+    hrec = load_hosts_state().get(rec["host"]) or {}
+    if (hrec.get("power") or {}).get("last_action", {}) \
+            and hrec["power"]["last_action"].get("id") == rec["id"]:
+        kw["last_action"] = _power_last_action(rec, verdict)
+        if verdict in ("VERIFIED", "VERIFIED-LATE",
+                       "CANCELLED-CONFIRMED"):
+            kw["expected_return_by"] = None
+    if kw:
+        _set_host_power(rec["host"], **kw)
+    hlog("POWER VERDICT host=%s action=%s verdict=%s record=%s"
+         % (rec["host"], rec["action"], verdict, rec["id"]))
+    return rec
+
+
+def _power_execute(rec, jobs):
+    """The accept path for one action record, shared by
+    `gk power` (immediate) and power_pass (a due scheduled
+    action): route proof, drain / active-job accounting,
+    the expected state and the going-down record — both
+    BEFORE any signal — then the signal itself. Returns
+    (outcome, rc): signaled / refused / unreachable /
+    signal-failed."""
+    host = rec["host"]
+    if jobs is None:
+        jobs = load_jobs()
+    route, _proof = _reboot_route(host)
+    if route is None:
+        ledger("host_power_requested", host=host, action=rec["action"],
+               requested_by=rec["requested_by"], route=None,
+               delay_s=rec["delay_s"])
+        _power_close(rec, "UNREACHABLE",
+                     "no live route proves the host (heartbeat "
+                     "stale and no runner online for it)")
+        return "unreachable", 4
+    rec["route"] = route
+    active = _host_active_jobs(host, jobs)
+    accounting = [j["id"] for j in active]
+    if rec.get("drain_requested"):
+        d = _drain_host(host, rec["requested_by"], jobs=jobs)
+        rec["drain"] = {
+            "verdict": "clean" if d["clean"] else "interrupting",
+            "checkpointed": d["checkpointed"],
+            "finished": d["finished"], "ended": d["ended"],
+            "uncheckpointed": d["uncheckpointed"],
+            "waiting": [j["id"] for j in d["queued"]]}
+        accounting = list(d["uncheckpointed"])
+        if accounting and not rec.get("override"):
+            save_power_action(rec)
+            ledger("host_power_requested", host=host,
+                   action=rec["action"],
+                   requested_by=rec["requested_by"], route=route,
+                   delay_s=rec["delay_s"])
+            _power_close(rec, "REFUSED",
+                         "drain left job(s) uncheckpointed: %s"
+                         % ", ".join(accounting))
+            return "refused", 3
+    elif accounting and not rec.get("override"):
+        ledger("host_power_requested", host=host,
+               action=rec["action"],
+               requested_by=rec["requested_by"], route=route,
+               delay_s=rec["delay_s"])
+        _power_close(rec, "REFUSED",
+                     "active job(s) on the host: %s"
+                     % ", ".join(accounting))
+        return "refused", 3
+    ledger("host_power_requested", host=host, action=rec["action"],
+           requested_by=rec["requested_by"], route=route,
+           delay_s=rec["delay_s"],
+           override=bool(rec.get("override")))
+    ts = now_iso()
+    # The expected state lands BEFORE any signal (FR-002):
+    # a poweroff's DOWN-BY-ACTION is what keeps the sweep
+    # from reading the planned down as an incident.
+    if rec["action"] == "poweroff":
+        _set_host_power(host, power_state="DOWN-BY-ACTION",
+                        last_action=_power_last_action(rec))
+        rec["expected_state_set_at"] = ts
+    # The going-down record, before the signal (FR-003),
+    # through spec 011's ingest unchanged.
+    gd = {"host": host, "ts": ts,
+          "trigger": "remote-poweroff" if rec["action"] == "poweroff"
+                     else "remote-reboot",
+          "active_run_ids": [j["run_id"] for j in active
+                             if j.get("run_id")],
+          "supervised": [],
+          "uncheckpointed": accounting}
+    ingest_going_down(gd, jobs=jobs)
+    rec["going_down"] = {"host": host, "ts": ts}
+    save_power_action(rec)
+    ok, detail = _power_signal(host, rec, route)
+    rec["signal"] = {"route": route, "ok": ok, "detail": detail,
+                    "ts": now_iso()}
+    if not ok:
+        _power_close(rec, "UNVERIFIED",
+                     "signal failed: %s" % detail)
+        return "signal-failed", 1
+    rec["state"] = "SIGNALED"
+    rec["signaled_at"] = rec["signal"]["ts"]
+    fire = parse_iso(rec["signaled_at"]) \
+        + timedelta(seconds=rec["delay_s"])
+    rec["fire_at"] = fire.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if rec["action"] == "reboot":
+        back_by = fire + timedelta(seconds=POWER_RETURN_WINDOW_S)
+        rec["expected_return_by"] = back_by.strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        _set_host_power(host, power_state="REBOOTING",
+                        last_action=_power_last_action(rec),
+                        expected_return_by=rec["expected_return_by"])
+    save_power_action(rec)
+    ledger("host_power_signaled", host=host, action=rec["action"],
+           record_id=rec["id"], route=route, delay_s=rec["delay_s"])
+    hlog("POWER SIGNALED host=%s action=%s route=%s record=%s"
+         % (host, rec["action"], route, rec["id"]))
+    return "signaled", 0
+
+
+def cmd_power(args):
+    host = args.host
+    action = args.action
+    if action == "cancel":
+        return _power_cancel(args)
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    if not args.requested_by:
+        print("ERROR: --requested-by is required (the chat "
+              "requesting the action is part of its audit "
+              "record)")
+        return 2
+    at = None
+    if getattr(args, "at", None):
+        at = parse_iso(args.at)
+        if at is None:
+            print("ERROR: --at must be an ISO timestamp "
+                  "(e.g. 2026-11-18T03:00:00Z)")
+            return 2
+    delay = REBOOT_GRACE_S if args.delay is None \
+        else max(0, int(args.delay))
+    rec = {"id": new_job_id("power-%s-%s" % (action, host)),
+           "host": host, "action": action,
+           "requested_by": args.requested_by,
+           "confirmer": getattr(args, "confirm", None)
+           if action == "poweroff" else None,
+           "override": ({"force": True,
+                         "reason": args.override_reason}
+                        if args.force else None),
+           "drain_requested": bool(getattr(args, "drain", False)),
+           "state": "OPEN", "created_at": now_iso(),
+           "scheduled_for": at.strftime("%Y-%m-%dT%H:%M:%SZ")
+           if at else None,
+           "delay_s": delay, "route": None, "drain": None,
+           "going_down": None, "signal": None,
+           "signaled_at": None, "fire_at": None,
+           "expected_return_by": None, "down_since": None,
+           "observed_down_at": None,
+           "cancel": None, "cancel_attempts": [],
+           "identity": None, "verdict": None, "verdict_ts": None}
+    save_power_action(rec)
+    # The gates. Each refusal closes the record REFUSED —
+    # the audit record is the point of the verb family.
+    if HOST_OFF_FLEET.get(host):
+        _power_close(rec, "REFUSED",
+                     "host is off-fleet (FR-016): no power verbs")
+        print("POWER REFUSED host=%s — off-fleet hosts take "
+              "no power verbs (FR-016)" % host)
+        return 3
+    if _power_body(host, action, delay) is None:
+        _power_close(rec, "REFUSED",
+                     "macOS takes no initiated power action in "
+                     "this spec (designed, not built)")
+        print("POWER REFUSED host=%s — no initiated power "
+              "action for macOS in this spec" % host)
+        return 3
+    if action == "poweroff" and args.confirm != host:
+        _power_close(rec, "REFUSED",
+                     "poweroff requires --confirm %s (the host "
+                     "name, repeated)" % host)
+        print("POWER REFUSED host=%s action=poweroff — "
+              "--confirm must repeat the host name" % host)
+        return 3
+    if args.force and not (args.override_reason
+                           and args.override_reason.strip()):
+        _power_close(rec, "REFUSED",
+                     "--force requires --override-reason")
+        print("POWER REFUSED host=%s — --force requires "
+              "--override-reason <text>" % host)
+        return 3
+    if at is not None and at > now_dt():
+        rec["state"] = "SCHEDULED"
+        save_power_action(rec)
+        ledger("host_power_requested", host=host, action=action,
+               requested_by=args.requested_by, route=None,
+               delay_s=delay, scheduled_for=rec["scheduled_for"])
+        print("POWER SCHEDULED host=%s action=%s at=%s "
+              "record=%s — route and drain accounting are "
+              "re-proven at fire time"
+              % (host, action, rec["scheduled_for"], rec["id"]))
+        return 0
+    outcome, rc = _power_execute(rec, None)
+    if outcome == "signaled":
+        print("POWER SIGNALED host=%s action=%s route=%s "
+              "delay_s=%s record=%s — the closing verdict "
+              "comes from the host's observed state, never "
+              "from the signal"
+              % (host, action, rec["route"], delay, rec["id"]))
+    elif outcome == "refused":
+        print("POWER REFUSED host=%s action=%s — %s "
+              "(record %s)" % (host, action,
+                                rec.get("verdict_detail"),
+                                rec["id"]))
+    elif outcome == "unreachable":
+        print("POWER UNREACHABLE host=%s action=%s — no live "
+              "route proves the host (record %s)"
+              % (host, action, rec["id"]))
+    else:
+        print("POWER SIGNAL FAILED host=%s action=%s — %s "
+              "(record %s)" % (host, action,
+                                rec.get("verdict_detail"),
+                                rec["id"]))
+    return rc
+
+
+def _power_cancel(args):
+    """`gk power --action cancel`: withdraw a scheduled
+    action outright, or send the OS abort for an in-grace
+    one. The verdict is settled later, from observed host
+    state at the fire time (power_pass) — never from the
+    abort's exit code (FR-006)."""
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    if not args.requested_by:
+        print("ERROR: --requested-by is required")
+        return 2
+    open_recs = _open_power_actions(host)
+    rec = None
+    if getattr(args, "id", None):
+        rec = next((a for a in open_recs
+                    if a["id"] == args.id), None)
+        if rec is None:
+            print("POWER CANCEL host=%s — no open power action "
+                  "with id %s" % (host, args.id))
+            return 1
+    elif len(open_recs) == 1:
+        rec = open_recs[0]
+    elif not open_recs:
+        print("POWER CANCEL host=%s — no open power action"
+              % host)
+        return 0
+    else:
+        print("POWER CANCEL host=%s — %d open power actions; "
+              "name one with --id: %s"
+              % (host, len(open_recs),
+                 ", ".join(a["id"] for a in open_recs)))
+        return 2
+    if rec["state"] == "SCHEDULED":
+        rec["cancel"] = {"by": args.requested_by, "ts": now_iso(),
+                         "how": "withdrawn before signal"}
+        _power_close(rec, "CANCELLED-CONFIRMED",
+                     "scheduled action withdrawn before any "
+                     "signal was sent")
+        print("POWER CANCELLED host=%s action=%s record=%s — "
+              "withdrawn before signal"
+              % (host, rec["action"], rec["id"]))
+        return 0
+    if rec["state"] == "CANCELLING":
+        print("POWER CANCEL host=%s record=%s — a cancel is "
+              "already in flight; its verdict settles from "
+              "observed state at the fire time"
+              % (host, rec["id"]))
+        return 0
+    fire = parse_iso(rec.get("fire_at") or "")
+    if fire is not None and now_dt() >= fire:
+        rec.setdefault("cancel_attempts", []).append(
+            {"by": args.requested_by, "ts": now_iso(),
+             "result": "not-cancellable: already fired"})
+        save_power_action(rec)
+        print("POWER NOT-CANCELLABLE host=%s record=%s — the "
+              "action already fired at %s; there is nothing "
+              "to withdraw" % (host, rec["id"], rec["fire_at"]))
+        return 1
+    if not rec["delay_s"]:
+        rec.setdefault("cancel_attempts", []).append(
+            {"by": args.requested_by, "ts": now_iso(),
+             "result": "not-cancellable: immediate signal, no "
+                       "abort handle"})
+        save_power_action(rec)
+        print("POWER NOT-CANCELLABLE host=%s record=%s — the "
+              "signal was immediate and carries no abort "
+              "handle" % (host, rec["id"]))
+        return 1
+    ok, detail = _power_abort_signal(host, rec)
+    rec["cancel"] = {"by": args.requested_by, "ts": now_iso(),
+                     "abort_ok": ok, "abort_detail": detail}
+    rec["state"] = "CANCELLING"
+    save_power_action(rec)
+    print("POWER CANCEL SENT host=%s record=%s abort=%s — "
+          "the verdict settles from the host's observed "
+          "state at the fire time (%s), never from the "
+          "abort's exit code"
+          % (host, rec["id"], detail, rec["fire_at"]))
+    return 0
+
+
+def power_pass(jobs=None):
+    """Settle open power actions from observed host state
+    (FR-002 / FR-005 / FR-006), and fire due scheduled
+    ones. Runs inside the sweep, contained by the caller.
+    Returns the number of actions that changed state."""
+    if jobs is None:
+        jobs = load_jobs()
+    settled = 0
+    now = now_dt()
+    for rec in load_power_actions():
+        host = rec["host"]
+        if rec.get("verdict"):
+            # A RETURN-MISSED reboot whose host later proves
+            # itself back amends to VERIFIED-LATE, both
+            # timestamps standing (FR-005).
+            if rec["verdict"] == "RETURN-MISSED" \
+                    and rec["action"] == "reboot":
+                back, ev = _power_host_back(
+                    host, rec.get("signaled_at"))
+                if back:
+                    rec["identity"] = (
+                        "%s — interim identity (fresh heartbeat "
+                        "+ runner state; the spec 011 T014 "
+                        "handshake is unbuilt)" % ev)
+                    rec["verdict"] = "VERIFIED-LATE"
+                    rec["verdict_ts"] = now_iso()
+                    save_power_action(rec)
+                    ledger("host_power_verified", host=host,
+                           action="reboot", record_id=rec["id"],
+                           verdict="VERIFIED-LATE", late=True)
+                    _set_host_power(
+                        host, power_state="UP",
+                        last_action=_power_last_action(
+                            rec, "VERIFIED-LATE"),
+                        expected_return_by=None)
+                    settled += 1
+            continue
+        if rec["state"] == "SCHEDULED":
+            due = parse_iso(rec.get("scheduled_for") or "")
+            if due is not None and now >= due:
+                _power_execute(rec, jobs)
+                settled += 1
+            continue
+        if rec["state"] == "CANCELLING":
+            fire = parse_iso(rec.get("fire_at") or "")
+            if fire is not None and now >= fire:
+                back, ev = _power_host_back(
+                    host, rec.get("signaled_at"))
+                if back:
+                    _power_close(
+                        rec, "CANCELLED-CONFIRMED",
+                        "host observed up past the fire time "
+                        "(%s)" % ev)
+                else:
+                    _power_close(
+                        rec, "CANCEL-FAILED",
+                        "host went down anyway — observed "
+                        "down at the fire time (%s)" % ev)
+                settled += 1
+            continue
+        if rec["state"] != "SIGNALED":
+            continue
+        fire = parse_iso(rec.get("fire_at") or "")
+        if rec["action"] == "reboot":
+            if fire is None or now < fire:
+                continue
+            back, ev = _power_host_back(host,
+                                        rec.get("signaled_at"))
+            if not back and not rec.get("observed_down_at"):
+                # First observed silence after firing. A
+                # return is only a return when the host was
+                # observed down first — a host that never
+                # went down proves nothing by being up.
+                rec["observed_down_at"] = now_iso()
+                save_power_action(rec)
+            expired = bool(rec.get("expected_return_by")
+                           and now > parse_iso(
+                               rec["expected_return_by"]))
+            if back and rec.get("observed_down_at"):
+                rec["identity"] = (
+                    "%s — interim identity (fresh heartbeat + "
+                    "runner state; the spec 011 T014 handshake "
+                    "is unbuilt)" % ev)
+                save_power_action(rec)
+                _power_close(rec, "VERIFIED",
+                             "host went down (observed %s) and "
+                             "proved itself back: %s"
+                             % (rec["observed_down_at"], ev))
+                settled += 1
+            elif expired and not back:
+                _power_close(
+                    rec, "RETURN-MISSED",
+                    "expected-return window (%ss) expired "
+                    "with the host observed down and no "
+                    "return" % POWER_RETURN_WINDOW_S)
+                open_downtime(
+                    host, "power-action:%s" % rec["id"],
+                    evidence={"open_action": rec}, jobs=jobs)
+                settled += 1
+            elif expired and back:
+                _power_close(
+                    rec, "UNVERIFIED",
+                    "host never went down inside the return "
+                    "window — the reboot did not take")
+                _set_host_power(host, power_state="UP")
+                settled += 1
+        elif rec["action"] == "poweroff":
+            if fire is None or now < fire:
+                continue
+            back, ev = _power_host_back(host,
+                                        rec.get("signaled_at"))
+            if back:
+                if rec.get("down_since"):
+                    _power_close(
+                        rec, "UNVERIFIED",
+                        "host returned during the confirm "
+                        "window (%s) — the poweroff did not "
+                        "hold it down" % ev)
+                    _set_host_power(host, power_state="UP")
+                    settled += 1
+                elif (now - fire).total_seconds() \
+                        > POWER_CONFIRM_DOWN_S:
+                    _power_close(
+                        rec, "UNVERIFIED",
+                        "host still up %ss after the poweroff "
+                        "fired — it never went down"
+                        % POWER_CONFIRM_DOWN_S)
+                    _set_host_power(host, power_state="UP")
+                    settled += 1
+            else:
+                if not rec.get("down_since"):
+                    rec["down_since"] = now_iso()
+                    save_power_action(rec)
+                elif (now - parse_iso(rec["down_since"])) \
+                        .total_seconds() >= POWER_CONFIRM_DOWN_S:
+                    _power_close(
+                        rec, "CONFIRMED-DOWN",
+                        "heartbeat and runners silent for "
+                        "the full %ss confirmation window"
+                        % POWER_CONFIRM_DOWN_S)
+                    settled += 1
+    return settled
+
+
+# --- Wake-on-LAN (spec 042, FR-010) -----------------------------------------
+#
+# A host may carry a `wol` config block {mac, via,
+# enabled}: the `via` host — a fleet host resident on the
+# target's LAN — sends the magic packet. A wake is an
+# ATTEMPT: its verdict is only ever the target's
+# subsequent boot-back identity, never the send. The host
+# record keeps the standing distinct: CONFIGURED (a block
+# exists, never yet proven), PROVEN (a wake was followed
+# by the host's observed return), FAILED (a first attempt
+# was made and the host never returned inside the
+# incident — recorded, never silently retried as if
+# unconfigured). Owner ruling D2: fixed wired hosts only;
+# roaming hosts are wake-free by design even if a block is
+# written for one, and macOS has no wake step at all.
+
+def _wol_block(host):
+    if HOST_ROAMING.get(host) or HOST_TYPE.get(host) == "macos":
+        return None
+    block = HOST_WOL.get(host)
+    if not block or not block.get("enabled"):
+        return None
+    return block
+
+
+def _wol_stored(host):
+    state = load_hosts_state()
+    return (state.get(host) or {}).get("wol")
+
+
+def _set_wol(host, **kw):
+    state = load_hosts_state()
+    rec = _host_record(state, host)
+    w = rec.get("wol")
+    if not isinstance(w, dict):
+        w = {"state": "CONFIGURED", "attempts": [],
+             "proven_at": None, "failed_at": None}
+        rec["wol"] = w
+    w.update(kw)
+    save_hosts_state(state)
+    return w
+
+
+def wol_standing(host):
+    """CONFIGURED / PROVEN / FAILED / NOT-CONFIGURED for
+    one host, from its config block and its record."""
+    if _wol_block(host) is None:
+        return "NOT-CONFIGURED"
+    stored = _wol_stored(host)
+    if stored and stored.get("state"):
+        return stored["state"]
+    return "CONFIGURED"
+
+
+def _wol_send(host, block):
+    """Execute the send on the `via` host: a maintenance
+    job on the sender's own lane running a small python
+    sender (stdlib sockets — no wakeonlan dependency on
+    the sender). (ok, detail). Slice 2 ships the module
+    and its fixtures; live sends happen only when the
+    ladder or an operator runs it against a real incident
+    (the Phase 6 field legs)."""
+    via = block["via"]
+    if HOST_TYPE.get(via) != "linux":
+        return False, ("via host %s is not a Linux host — "
+                       "the sender build covers Linux senders"
+                       % via)
+    lanes = _host_lanes(via)
+    if not lanes:
+        return False, "via host %s has no lane" % via
+    mac = block["mac"]
+    script_name = "wol-send-%s.sh" % host
+    script_path = os.path.join(BASE, script_name)
+    script = (
+        "#!/bin/sh\n"
+        "python3 - @MAC@ <<'PYEOF'\n"
+        "import socket, sys\n"
+        "mac = sys.argv[1].replace(':', '')\n"
+        "pkt = b'\\xff' * 6 + bytes.fromhex(mac) * 16\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)\n"
+        "for _ in range(3):\n"
+        "    s.sendto(pkt, ('255.255.255.255', 9))\n"
+        "print('WOL_SENT mac=%s bytes=%d' % (sys.argv[1], len(pkt)))\n"
+        "PYEOF\n").replace("@MAC@", mac)
+    try:
+        _write_text_file(script_path, script)
+    except (IOError, OSError) as exc:
+        return False, "could not write the sender script (%s)" % exc
+    sub_args = types.SimpleNamespace(
+        key="gk-wol-%s-%s" % (host,
+                              now_dt().strftime("%Y%m%dT%H%M%SZ")),
+        program="syncyard", workflow="linux.yml", lane=lanes[0],
+        script=script_path, grab_path=None, cwd=None, image=None,
+        mounts=None, expected_min=1.0, maintenance=True,
+        notify_chat=None)
+    rc = cmd_submit(sub_args)
+    if rc != 0:
+        return False, "sender job not accepted (submit rc=%d)" % rc
+    return True, "sender job queued on %s" % via
+
+
+def wol_attempt(host):
+    """One wake attempt for `host`. Returns (outcome,
+    detail): WOL-SENT, WOL-SEND-FAILED, or
+    WOL-NOT-CONFIGURED (no block, disabled, macOS, or a
+    roaming host — the ladder records it and moves on).
+    Every real attempt is logged with sender, target, and
+    time, on the ledger and the host record."""
+    block = _wol_block(host)
+    if block is None:
+        return "WOL-NOT-CONFIGURED", (
+            "no enabled wol block for %s (or the host is "
+            "excepted)" % host)
+    ok, detail = _wol_send(host, block)
+    w = _set_wol(host)
+    w.setdefault("attempts", []).append(
+        {"ts": now_iso(), "sender": block["via"], "ok": ok,
+         "detail": detail})
+    _set_wol(host, attempts=w["attempts"])
+    ledger("wol_attempt", host=host, via=block["via"],
+           mac=block["mac"], ok=ok)
+    hlog("WOL ATTEMPT host=%s via=%s ok=%s"
+         % (host, block["via"], ok))
+    return ("WOL-SENT" if ok else "WOL-SEND-FAILED"), detail
+
+
+def wol_note_return(host):
+    """The host returned after a wake attempt: a
+    CONFIGURED standing becomes PROVEN, with the time.
+    Called from the downtime close paths — the return is
+    the proof, per FR-010."""
+    stored = _wol_stored(host)
+    if stored and stored.get("state") == "CONFIGURED" \
+            and stored.get("attempts"):
+        _set_wol(host, state="PROVEN", proven_at=now_iso())
+        ledger("wol_proven", host=host, proven_at=now_iso())
+
+
+def wol_note_failed(host):
+    """A wake was attempted in an incident the host never
+    returned from: the standing becomes FAILED — recorded,
+    so no later step treats the host as merely
+    unconfigured."""
+    stored = _wol_stored(host)
+    if stored and stored.get("state") == "CONFIGURED" \
+            and stored.get("attempts"):
+        _set_wol(host, state="FAILED", failed_at=now_iso())
+        ledger("wol_failed", host=host, failed_at=now_iso())
+
+
+def cmd_wol(args):
+    """`gk wol --host <host>`: one wake attempt now, and
+    the host's wake standing printed either way."""
+    host = args.host
+    if host not in _CFG["hosts"]:
+        print("ERROR: unknown host '%s' (config hosts: %s)"
+              % (host, ", ".join(sorted(_CFG["hosts"]))))
+        return 2
+    outcome, detail = wol_attempt(host)
+    print("WOL host=%s outcome=%s standing=%s — %s"
+          % (host, outcome, wol_standing(host), detail))
+    return 0 if outcome == "WOL-SENT" else 1
+
+
+# --- Recovery ladder (spec 042, FR-014 / FR-015) -----------------------------
+#
+# On a downtime record's opening (never for BY-ACTION,
+# never for the FR-016 exceptions beyond their limited
+# form), the ladder works the incident in order, lesser
+# steps first, every step logged to the record with its
+# evidence and timestamp: (1) re-probe all channels,
+# (2) wake where configured, (3) backoff re-probes at
+# +2/+5/+10 min, (4) the lesser stack restart over a
+# channel that proves the host alive, (5) ONE controlled
+# reboot over a proven-live route — never a second. The
+# total bound is downtime.ladder_budget_s; at expiry with
+# the host still down the record flips to NEEDS-PHYSICAL
+# (FR-015) and active steps stop; after the flip only the
+# slow re-probe runs. Recovery is claimed only on the
+# host's own identity (the FR-005 standard), never on
+# another channel's liveness alone. The ladder runs on
+# the sweep cadence (ladder_pass), one stage per pass, so
+# no sweep ever blocks on a wait.
+
+def _ladder_probe(host):
+    """One probe of every channel the gatekeeper can read
+    (the ladder's step-1 instrument, and the seam its
+    fixtures script). Channels with no gatekeeper-side
+    read today report None — unknown, never guessed:
+    the Syncyard agent channel and a LAN-resident prober
+    are host-side instruments whose readings arrive as
+    fleet facts, not gatekeeper reads."""
+    out = {"heartbeat_age_s": None, "runners_online": None,
+           "agent": None, "lan_reachable": None}
+    if host in heartbeat_hosts():
+        hb, _err = fetch_backchannel_heartbeat()
+        if hb is not None:
+            ts = parse_iso(hb.get("ts"))
+            if ts is not None:
+                out["heartbeat_age_s"] = (
+                    now_dt() - ts).total_seconds()
+    data, err = gh_json(["api", "repos/%s/actions/runners" % REPO])
+    if not err and isinstance(data, dict):
+        out["runners_online"] = len([
+            r for r in data.get("runners") or []
+            if str(r.get("name") or "").startswith(host)
+            and r.get("status") == "online"])
+    return out
+
+
+def _ladder_identity(host, rec, probe):
+    """(back, evidence): the host's OWN identity answers —
+    a heartbeat stamp newer than the incident's first
+    detection, or the host's runners observed offline at
+    the ladder's first probe and online now. Another
+    channel's liveness alone never closes an incident."""
+    state = load_hosts_state()
+    hb_ts = (state.get(host) or {}).get("last_heartbeat_ts")
+    if hb_ts and hb_ts > rec["first_detected"]:
+        return True, "heartbeat %s (after first detection)" % hb_ts
+    ls = rec.get("ladder_state") or {}
+    first = ls.get("first_probe") or {}
+    if first.get("runners_online") == 0 \
+            and (probe.get("runners_online") or 0) > 0:
+        return True, ("runners offline at first probe, %d "
+                      "online now" % probe["runners_online"])
+    return False, "no identity evidence"
+
+
+def _ladder_stack_restart(host):
+    """The ladder's step-4 instrument (FR-009's verb
+    surface). The on-host restart internals are spec
+    040's; until that surface lands, the step reports
+    itself unavailable — logged in the record, never
+    faked — and the ladder moves to its next step."""
+    return False, ("host-restart surface unbuilt: spec 040 "
+                   "owns the on-host restart internals")
+
+
+def _ladder_log(rec, step, outcome, evidence):
+    rec.setdefault("ladder", []).append(
+        {"step": step, "ts": now_iso(), "outcome": outcome,
+         "evidence": evidence})
+
+
+def _save_downtime_rec(rec):
+    data = load_downtime()
+    if rec["host"] in data["open"]:
+        data["open"][rec["host"]] = rec
+        save_downtime(data)
+
+
+def _ladder_flip(rec, why):
+    """Budget expiry with the host still down: log the
+    flip, mark a tried wake FAILED if it never proved,
+    and escalate (the one push)."""
+    _ladder_log(rec, "flip", "NEEDS-PHYSICAL", why)
+    _save_downtime_rec(rec)
+    if (rec.get("ladder_state") or {}).get("wake_attempted"):
+        wol_note_failed(rec["host"])
+    escalate_downtime(rec["host"], by="ladder")
+
+
+def _ladder_close_for(rec, probe):
+    """Judge a proven return: which closing, and does the
+    ladder get the credit? An active step's recovery is
+    RECOVERED-BY-LADDER with the step named; a return the
+    ladder only witnessed is RECOVERED-UNASSISTED."""
+    ls = rec.get("ladder_state") or {}
+    step = ls.get("active_step")
+    back, ev = _ladder_identity(rec["host"], rec, probe)
+    if not back:
+        return False
+    wol_note_return(rec["host"])
+    if step in ("wake", "lesser", "reboot"):
+        close_downtime(
+            rec["host"], "RECOVERED-BY-LADDER",
+            account="recovered at ladder step %s — %s"
+                    % ({"wake": "2 (wake)",
+                        "lesser": "4 (stack restart)",
+                        "reboot": "5 (controlled reboot)"}[step],
+                       ev))
+    else:
+        close_downtime(
+            rec["host"], "RECOVERED-UNASSISTED",
+            account="host answered on its own identity — %s"
+                    % ev)
+    return True
+
+
+def _ladder_host(rec, jobs):
+    host = rec["host"]
+    ls = rec.get("ladder_state")
+    if ls is None:
+        return
+    off_fleet = bool(HOST_OFF_FLEET.get(host))
+    probe = _ladder_probe(host)
+    if ls.get("first_probe") is None:
+        ls["first_probe"] = dict(probe)
+        _save_downtime_rec(rec)
+    if _ladder_close_for(rec, probe):
+        return
+    started = parse_iso(ls["started_at"])
+    budget_end = started + timedelta(
+        seconds=DOWNTIME_LADDER_BUDGET_S) if started else None
+    if budget_end is not None and now_dt() > budget_end:
+        _ladder_flip(rec, "ladder budget (%ss) expired with "
+                          "the host still down"
+                          % DOWNTIME_LADDER_BUDGET_S)
+        return
+    stage = ls["stage"]
+    if stage == "start":
+        if rec["state"] == "OPEN":
+            rec["state"] = "LADDER"
+        _ladder_log(rec, 1, "re-probed",
+                    "heartbeat_age_s=%s runners_online=%s "
+                    "agent=%s lan_reachable=%s"
+                    % (probe["heartbeat_age_s"],
+                       probe["runners_online"], probe["agent"],
+                       probe["lan_reachable"]))
+        if off_fleet:
+            _ladder_log(rec, 2, "skipped",
+                        "off-fleet: the ladder is re-probe only")
+            ls["wake_attempted"] = False
+        else:
+            outcome, detail = wol_attempt(host)
+            _ladder_log(rec, 2, outcome, detail)
+            ls["wake_attempted"] = outcome == "WOL-SENT"
+            if ls["wake_attempted"]:
+                ls["active_step"] = "wake"
+        ls["stage"] = "backoff"
+        ls["backoff_idx"] = 0
+        ls["next_due"] = (started + timedelta(
+            seconds=DOWNTIME_LADDER_BACKOFF_S[0])).strftime(
+                "%Y-%m-%dT%H:%M:%SZ") if started else None
+        _save_downtime_rec(rec)
+        return
+    if stage == "backoff":
+        due = parse_iso(ls.get("next_due") or "")
+        if due is None or now_dt() < due:
+            return
+        idx = ls["backoff_idx"]
+        _ladder_log(rec, 3, "re-probed",
+                    "backoff +%ss: heartbeat_age_s=%s "
+                    "runners_online=%s"
+                    % (DOWNTIME_LADDER_BACKOFF_S[idx],
+                       probe["heartbeat_age_s"],
+                       probe["runners_online"]))
+        idx += 1
+        ls["backoff_idx"] = idx
+        if idx >= len(DOWNTIME_LADDER_BACKOFF_S):
+            ls["stage"] = "lesser"
+        else:
+            ls["next_due"] = (started + timedelta(
+                seconds=DOWNTIME_LADDER_BACKOFF_S[idx])).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+        _save_downtime_rec(rec)
+        return
+    if stage == "lesser":
+        if off_fleet:
+            _ladder_log(rec, 4, "skipped",
+                        "off-fleet: no stack restart, no "
+                        "power verbs")
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+            return
+        alive = bool(probe.get("lan_reachable")
+                     or probe.get("agent"))
+        if not alive:
+            _ladder_log(rec, 4, "skipped",
+                        "no channel proves the host alive — "
+                        "a stack restart has no channel to "
+                        "ride")
+            ls["stage"] = "reboot"
+            _save_downtime_rec(rec)
+            return
+        ok, detail = _ladder_stack_restart(host)
+        _ladder_log(rec, 4, "restarted" if ok else "unavailable",
+                    detail)
+        if ok:
+            ls["active_step"] = "lesser"
+            _save_downtime_rec(rec)
+            probe2 = _ladder_probe(host)
+            if _ladder_close_for(rec, probe2):
+                return
+        ls["stage"] = "reboot"
+        _save_downtime_rec(rec)
+        return
+    if stage == "reboot":
+        if off_fleet:
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+            return
+        prec = {"id": new_job_id("power-reboot-%s" % host),
+                "host": host, "action": "reboot",
+                "requested_by": "downtime-ladder",
+                "confirmer": None, "override": None,
+                "drain_requested": False, "state": "OPEN",
+                "created_at": now_iso(), "scheduled_for": None,
+                "delay_s": REBOOT_GRACE_S, "route": None,
+                "drain": None, "going_down": None, "signal": None,
+                "signaled_at": None, "fire_at": None,
+                "expected_return_by": None, "down_since": None,
+                "observed_down_at": None, "cancel": None,
+                "cancel_attempts": [], "identity": None,
+                "verdict": None, "verdict_ts": None}
+        save_power_action(prec)
+        outcome, _rc = _power_execute(prec, jobs)
+        _ladder_log(rec, 5, outcome,
+                    "controlled reboot action %s (drain "
+                    "accounting in the action record)"
+                    % prec["id"])
+        if outcome == "signaled":
+            ls["reboot_action"] = prec["id"]
+            ls["active_step"] = "reboot"
+            ls["stage"] = "await-return"
+        else:
+            ls["stage"] = "flip-wait"
+        _save_downtime_rec(rec)
+        return
+    if stage == "await-return":
+        aid = ls.get("reboot_action")
+        arec = next((a for a in load_power_actions()
+                     if a["id"] == aid), None)
+        if arec is not None and arec.get("verdict") in (
+                "RETURN-MISSED", "UNVERIFIED", "REFUSED",
+                "UNREACHABLE"):
+            _ladder_log(rec, 5, "reboot-closed-%s"
+                        % arec["verdict"],
+                        "the controlled reboot did not bring "
+                        "the host back")
+            ls["stage"] = "flip-wait"
+            _save_downtime_rec(rec)
+        return
+    # "flip-wait": nothing left but the budget, judged at
+    # the top of the next pass.
+
+
+def ladder_pass(jobs=None):
+    """Run the recovery ladder one stage per open record,
+    and the slow re-probe for flipped ones. Sweep-driven,
+    contained by the caller. Returns the number of records
+    touched."""
+    if jobs is None:
+        jobs = load_jobs()
+    touched = 0
+    for host in list(load_downtime()["open"].keys()):
+        rec = downtime_open_record(host)
+        if rec is None:
+            continue
+        try:
+            if rec["state"] == "NEEDS-PHYSICAL":
+                ls = rec.get("ladder_state") or {}
+                last = parse_iso(ls.get("last_slow_reprobe")
+                                 or rec.get("physical", {})
+                                 .get("flipped_at") or "")
+                if last is not None and (
+                        now_dt() - last).total_seconds() \
+                        < DOWNTIME_SLOW_REPROBE_S:
+                    continue
+                ls["last_slow_reprobe"] = now_iso()
+                rec["ladder_state"] = ls
+                _save_downtime_rec(rec)
+                probe = _ladder_probe(host)
+                back, ev = _ladder_identity(host, rec, probe)
+                _ladder_log(rec, "slow-reprobe",
+                            "returned" if back else "still-down",
+                            ev)
+                _save_downtime_rec(rec)
+                if back:
+                    wol_note_return(host)
+                    close_downtime(
+                        host, "RECOVERED-UNASSISTED",
+                        account="slow re-probe after "
+                                "NEEDS-PHYSICAL: %s" % ev)
+                touched += 1
+                continue
+            if rec.get("class") == "BY-ACTION" \
+                    or rec.get("ladder_state") is None:
+                continue
+            _ladder_host(rec, jobs)
+            touched += 1
+        except Exception as exc:
+            ledger_soft("ladder_error", host=host,
+                        error=str(exc)[:200])
+    return touched
+
 
 def cmd_profile(args):
     """render the profile table. Read-only —
@@ -5972,10 +7746,22 @@ def cmd_status(args):
                                     j.get("held_at_checkpoint_at")))
     issues = [(j, job_issues(j)) for j in jobs]
     issues = [(j, i) for (j, i) in issues if i]
-    print("\nISSUES: %d" % len(issues))
+    # Spec 042 (FR-007): a power action
+    # record with no closing verdict is an ISSUES entry
+    # until it closes — an action that never got its
+    # verdict is never a silent success.
+    power_open = [a for a in load_power_actions()
+                  if not a.get("verdict")]
+    print("\nISSUES: %d" % (len(issues) + len(power_open)))
     for j, iss in issues:
         for s in iss:
             print("  [%s] %s — %s" % (j["program"], j["key"], s))
+    for a in power_open:
+        print("  [power] %s — open power action %s on %s "
+              "(state %s, requested by %s) has no closing "
+              "verdict yet"
+              % (a["id"], a.get("action"), a.get("host"),
+                 a.get("state"), a.get("requested_by")))
     if os.path.isfile(LEDGER):
         with open(LEDGER, encoding="utf-8") as f:
             lines = [ln for ln in f.read().splitlines() if ln.strip()]
@@ -6146,7 +7932,23 @@ def build_snapshot():
         queue_state = "full"
     else:
         queue_state = "running"
-    return {
+    # Spec 042 power section (FR-008):
+    # per-host power state for every host whose liveness
+    # record carries one. Hosts with no power history are
+    # absent, so a power-free fleet's snapshot is unchanged.
+    hosts_power = {}
+    for hname, hrec in load_hosts_state().items():
+        pw = hrec.get("power")
+        if not pw:
+            continue
+        entry = {"power_state": pw.get("power_state") or "UNKNOWN",
+                 "last_seen_alive": hrec.get("last_heartbeat_ts")}
+        if pw.get("last_action"):
+            entry["last_action"] = pw["last_action"]
+        if pw.get("expected_return_by"):
+            entry["expected_return_by"] = pw["expected_return_by"]
+        hosts_power[hname] = entry
+    snap = {
         "generated_at": now_iso(),
         "mode": mode,
         "draining": draining,
@@ -6159,6 +7961,9 @@ def build_snapshot():
         "running_total": running_total,
         "waiting_total": waiting_total,
     }
+    if hosts_power:
+        snap["hosts_power"] = hosts_power
+    return snap
 
 
 def cmd_snapshot(_args):
@@ -6442,6 +8247,96 @@ def main(argv=None):
                    help="chat id requesting the drain (recorded "
                         "in the ledger)")
     p.set_defaults(fn=cmd_drain)
+
+    p = sub.add_parser("power",
+                       help="controlled power for one host "
+                            "(spec 042): --action reboot | "
+                            "poweroff | cancel, Linux route "
+                            "first, drain-before-signal, an "
+                            "audit record per action, and a "
+                            "closing verdict from the host's "
+                            "observed state — never from the "
+                            "signal. Exit 0 = signaled / "
+                            "scheduled / cancel reported, "
+                            "1 = signal failed or NOT-"
+                            "CANCELLABLE, 2 = usage error, "
+                            "3 = refused, 4 = unreachable")
+    p.add_argument("--host", required=True,
+                   help="config host name, e.g. tower-compute")
+    p.add_argument("--action", required=True,
+                   choices=("reboot", "poweroff", "cancel"),
+                   help="the power action; cancel targets the "
+                        "host's open action (or --id)")
+    p.add_argument("--id", default=None,
+                   help="for --action cancel: the power "
+                        "action record id to cancel")
+    p.add_argument("--delay", type=int, default=None,
+                   help="OS grace delay in seconds before the "
+                        "action fires (default: reboot.grace_s, "
+                        "60); 0 fires immediately and carries "
+                        "no abort handle")
+    p.add_argument("--at", default=None,
+                   help="schedule instead of signaling now: "
+                        "an ISO timestamp at which the action "
+                        "fires (route and drain accounting "
+                        "re-proven then); a scheduled action "
+                        "can be withdrawn outright")
+    p.add_argument("--confirm", default=None,
+                   help="poweroff only: repeat the host name "
+                        "to confirm — the gate that keeps a "
+                        "poweroff from being a typo")
+    p.add_argument("--drain", action="store_true",
+                   help="run the spec 011 host drain first "
+                        "and let its verdict gate the signal "
+                        "(an UNCHECKPOINTED job refuses the "
+                        "action unless --force overrides)")
+    p.add_argument("--force", action="store_true",
+                   help="proceed despite active jobs; "
+                        "requires --override-reason")
+    p.add_argument("--override-reason", default=None,
+                   help="why the override is right; recorded "
+                        "in the action record and the ledger")
+    p.add_argument("--requested-by", default=None,
+                   help="chat id requesting the action "
+                        "(required; part of the audit record)")
+    p.set_defaults(fn=cmd_power)
+
+    p = sub.add_parser("downtime",
+                       help="the fleet downtime record "
+                            "(spec 042): hand-file a record "
+                            "for a host, or --escalate it to "
+                            "NEEDS-PHYSICAL, or --close it")
+    p.add_argument("--host", required=True,
+                   help="config host name")
+    p.add_argument("--note", default=None,
+                   help="a note carried on the record (the "
+                        "hand-filing's account, or the close "
+                        "account with --close)")
+    p.add_argument("--escalate", action="store_true",
+                   help="flip the open record to "
+                        "NEEDS-PHYSICAL (named owner + on-site "
+                        "checklist attach; the one downtime "
+                        "push, main chat only)")
+    p.add_argument("--close", action="store_true",
+                   help="close the open record as "
+                        "RECOVERED-UNASSISTED with --note as "
+                        "the closing account")
+    p.add_argument("--requested-by", default=None,
+                   help="chat id acting (recorded)")
+    p.set_defaults(fn=cmd_downtime)
+
+    p = sub.add_parser("wol",
+                       help="wake-on-LAN (spec 042 FR-010): "
+                            "one wake attempt for a host via "
+                            "its configured LAN-resident "
+                            "sender, and the host's wake "
+                            "standing (CONFIGURED / PROVEN / "
+                            "FAILED / NOT-CONFIGURED). A wake "
+                            "is an attempt — it is proven only "
+                            "by the host's observed return")
+    p.add_argument("--host", required=True,
+                   help="config host name")
+    p.set_defaults(fn=cmd_wol)
 
     p = sub.add_parser("status")
     p.add_argument("--repo", action="store_true",
